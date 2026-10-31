@@ -11,12 +11,36 @@ import os
 import shutil
 import subprocess
 import tempfile
+import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-# TODO: the Go module path / release URL for loom is pending an owner decision
-# Do not hardcode one; set LOOM_INSTALL_URL meanwhile.
+# TODO: path decided as github.com/choilab-jefferson/nexus.loom; the install URL
+# is pending a loom release tag. Set LOOM_INSTALL_URL meanwhile.
 LOOM_INSTALL_URL = os.environ.get("LOOM_INSTALL_URL")
+
+MIN_LOOM_VERSION = "0.1.0"
+
+_ENV_ALLOW = frozenset({
+    "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR",
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY", "OLLAMA_HOST",
+})
+
+
+def loom_env(extra: Optional[Iterable[str]] = None) -> Dict[str, str]:
+    """Copy only allowlisted vars (plus LOOM_* and `extra` names) from os.environ."""
+    allow = _ENV_ALLOW | set(extra or ())
+    return {k: v for k, v in os.environ.items() if k in allow or k.startswith("LOOM_")}
+
+
+def _parse_version(v: str) -> Optional[Tuple[int, ...]]:
+    v = v.strip().lstrip("vV").split("-", 1)[0].split("+", 1)[0]
+    parts = v.split(".")
+    if not 1 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts) + (0,) * (3 - len(parts))
+
 
 DEFAULT_EXIT_CODES: Dict[str, int] = {
     "ok": 0,
@@ -39,6 +63,13 @@ class LoomProbe:
     path: Optional[str] = None
     capabilities: Optional[Dict[str, Any]] = None
     error: str = ""
+    version: Optional[str] = None
+
+    @property
+    def version_ok(self) -> bool:
+        """True when version is unknown/unparseable (permissive) or >= MIN_LOOM_VERSION."""
+        parsed = _parse_version(self.version) if self.version else None
+        return parsed is None or parsed >= _parse_version(MIN_LOOM_VERSION)
 
 
 def probe(bin: Optional[str] = None, timeout: float = 10.0) -> LoomProbe:
@@ -63,7 +94,11 @@ def probe(bin: Optional[str] = None, timeout: float = 10.0) -> LoomProbe:
         return LoomProbe(False, path, None, f"invalid capabilities JSON: {e}")
     if not isinstance(caps, dict):
         return LoomProbe(False, path, None, "invalid capabilities JSON: not an object")
-    return LoomProbe(True, path, caps, "")
+    ver = caps.get("version")
+    pr = LoomProbe(True, path, caps, "", ver if isinstance(ver, str) else None)
+    if not pr.version_ok:
+        warnings.warn(f"loom {pr.version} is older than minimum {MIN_LOOM_VERSION}", stacklevel=2)
+    return pr
 
 
 @dataclass
@@ -96,9 +131,11 @@ def _read_trace(path: Optional[str]) -> List[Dict[str, Any]]:
 
 
 class LoomAdapter:
-    def __init__(self, bin: Optional[str] = None, timeout: Optional[float] = None):
+    def __init__(self, bin: Optional[str] = None, timeout: Optional[float] = None,
+                 env_passthrough: Optional[Iterable[str]] = None):
         self.bin = bin
         self.timeout = timeout
+        self.env_passthrough = list(env_passthrough or [])
         self._codes: Optional[Dict[str, int]] = None
 
     def _path(self) -> Optional[str]:
@@ -128,7 +165,7 @@ class LoomAdapter:
         try:
             p = subprocess.run(
                 [path, *args], capture_output=True, text=True,
-                timeout=self.timeout, env=os.environ.copy(),
+                timeout=self.timeout, env=loom_env(self.env_passthrough),
             )
         except subprocess.TimeoutExpired as e:
             out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")

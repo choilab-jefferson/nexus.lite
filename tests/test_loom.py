@@ -12,24 +12,25 @@ FAKE = r'''#!{py}
 import json, os, sys, time
 a = sys.argv[1:]
 if a[:1] == ["capabilities"]:
-    mode = os.environ.get("FAKE_CAPS", "ok")
+    mode = os.environ.get("LOOM_FAKE_CAPS", "ok")
     if mode == "bad":
         print("not json"); sys.exit(0)
     if mode == "fail":
         sys.exit(5)
     print(json.dumps({{"exit_codes": {{"ok": 0, "task_failure": 1}}, "providers": ["mock"],
-                       "schema_version": 1, "spec_version": "1", "harness": "loom"}}))
+                       "schema_version": 1, "spec_version": "1", "harness": "loom",
+                       **({{"version": os.environ["LOOM_FAKE_VER"]}} if "LOOM_FAKE_VER" in os.environ else {{}})}}))
     sys.exit(0)
-if os.environ.get("FAKE_SLEEP"):
-    time.sleep(float(os.environ["FAKE_SLEEP"]))
+if os.environ.get("LOOM_FAKE_SLEEP"):
+    time.sleep(float(os.environ["LOOM_FAKE_SLEEP"]))
 if "--trace" in a:
     with open(a[a.index("--trace") + 1], "w") as f:
         f.write(json.dumps({{"event": "start"}}) + "\n" + "garbage\n" + json.dumps({{"event": "end"}}) + "\n")
-rc = int(os.environ.get("FAKE_RC", "0"))
+rc = int(os.environ.get("LOOM_FAKE_RC", "0"))
 if rc == 3:
     print(json.dumps({{"escalate": "need human"}}))
 else:
-    info = {{"args": a}}
+    info = {{"args": a, "env": sorted(os.environ)}}
     if "--task-file" in a:
         info["task"] = json.load(open(a[a.index("--task-file") + 1]))
     print(json.dumps(info))
@@ -65,7 +66,7 @@ def test_probe_success(fake):
 
 @pytest.mark.parametrize("mode", ["bad", "fail"])
 def test_probe_bad(fake, monkeypatch, mode):
-    monkeypatch.setenv("FAKE_CAPS", mode)
+    monkeypatch.setenv("LOOM_FAKE_CAPS", mode)
     pr = probe()
     assert not pr.available and pr.error
 
@@ -79,7 +80,7 @@ def test_probe_missing_binary(tmp_path):
                                        (3, "escalation_required"), (4, "budget"), (130, "interrupted"),
                                        (77, "unknown")])
 def test_exit_codes(fake, monkeypatch, rc, status):
-    monkeypatch.setenv("FAKE_RC", str(rc))
+    monkeypatch.setenv("LOOM_FAKE_RC", str(rc))
     r = LoomAdapter().run_prompt("hi", provider="mock", model="m", max_turns=3)
     assert r.returncode == rc and r.status == status
     assert r.ok == (rc == 0) and r.retryable == (rc == 1)
@@ -89,7 +90,7 @@ def test_exit_codes(fake, monkeypatch, rc, status):
 
 
 def test_escalation_json(fake, monkeypatch):
-    monkeypatch.setenv("FAKE_RC", "3")
+    monkeypatch.setenv("LOOM_FAKE_RC", "3")
     r = LoomAdapter().run_prompt("hi")
     assert r.result == {"escalate": "need human"}
 
@@ -110,10 +111,49 @@ def test_run_task_dict_and_path(fake, tmp_path):
 
 
 def test_timeout(fake, monkeypatch):
-    monkeypatch.setenv("FAKE_SLEEP", "5")
+    monkeypatch.setenv("LOOM_FAKE_SLEEP", "5")
     r = LoomAdapter(timeout=0.5).run_prompt("hi")
     assert r.status == "timeout" and not r.ok and r.returncode is None
 
 
 def test_install_url_is_env_driven():
     assert loom.LOOM_INSTALL_URL == os.environ.get("LOOM_INSTALL_URL")
+
+
+def test_env_allowlist(fake, monkeypatch):
+    monkeypatch.setenv("SECRET_TOKEN", "x")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("LOOM_X", "1")
+    env = LoomAdapter().run_prompt("hi").result["env"]
+    assert "SECRET_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" in env and "LOOM_X" in env
+
+
+def test_env_passthrough_extension(fake, monkeypatch):
+    monkeypatch.setenv("MY_VAR", "1")
+    assert "MY_VAR" not in LoomAdapter().run_prompt("hi").result["env"]
+    assert "MY_VAR" in LoomAdapter(env_passthrough=["MY_VAR"]).run_prompt("hi").result["env"]
+
+
+def test_version_missing(fake):
+    pr = probe()
+    assert pr.version is None and pr.version_ok
+
+
+def test_version_ok(fake, monkeypatch):
+    monkeypatch.setenv("LOOM_FAKE_VER", "v0.1.2")
+    pr = probe()
+    assert pr.version == "v0.1.2" and pr.version_ok
+
+
+def test_version_old_warns(fake, monkeypatch):
+    monkeypatch.setenv("LOOM_FAKE_VER", "0.0.9")
+    with pytest.warns(UserWarning):
+        pr = probe()
+    assert not pr.version_ok
+
+
+def test_version_unparseable(fake, monkeypatch):
+    monkeypatch.setenv("LOOM_FAKE_VER", "dev")
+    pr = probe()
+    assert pr.version == "dev" and pr.version_ok

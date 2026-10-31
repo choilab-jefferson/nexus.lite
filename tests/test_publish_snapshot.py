@@ -87,3 +87,59 @@ def test_snapshot_single_commit_no_remote(tmp_path):
     log = subprocess.check_output(["git", "-C", str(d), "log", "--format=%s|%an"], text=True).splitlines()
     assert len(log) == 1 and log[0].startswith("Release v1.0.0 (snapshot of nexus.lite@") and log[0].endswith("|Pub")
     assert subprocess.check_output(["git", "-C", str(d), "remote"], text=True).strip() == ""
+
+
+# ---- release ----
+def _rel(tmp_path, cfg=None, extra=None, **kw):
+    r = _repo(tmp_path, extra)
+    c = dict(CFG, github_url="git@example.com:o/r.git", **(cfg or {}))
+    out = tmp_path / "rel"
+    return ps.release(kw.pop("version", "v1.2.3"), "HEAD", out, c, repo=str(r), **kw), out
+
+
+def test_release_dry_run_prints_push_cmds(tmp_path, capsys):
+    rc, out = _rel(tmp_path, cfg={"license": "TODO x"}, dry_run=True)
+    o = capsys.readouterr()
+    assert rc == 0 and not out.exists()
+    assert "leak-check: OK" in o.out and "WARNING" in o.err
+    assert "--force" not in o.out
+    assert "git fetch git@example.com:o/r.git main:gh-main" in o.out
+    assert "git read-tree -u --reset release/v1.2.3" in o.out
+    assert "git push git@example.com:o/r.git publish/v1.2.3:refs/heads/main" in o.out
+    assert "git push git@example.com:o/r.git refs/tags/v1.2.3" in o.out
+
+
+def test_release_todo_config_refuses(tmp_path, capsys):
+    rc, out = _rel(tmp_path, cfg={"public_author_name": "TODO owner"})
+    assert rc == 2 and not out.exists()
+    assert "public_author_name" in capsys.readouterr().err
+
+
+def test_release_real_makes_bundle(tmp_path):
+    rc, out = _rel(tmp_path, extra={"LICENSE": "MIT\n"}, cfg={
+        "allowlist": CFG["allowlist"] + ["LICENSE"]})
+    assert rc == 0
+    b = out / "nexus-lite-v1.2.3.bundle"
+    heads = subprocess.check_output(["git", "bundle", "list-heads", str(b)], text=True)
+    assert "refs/heads/release/v1.2.3" in heads and "refs/tags/v1.2.3" in heads
+    tree = out / "tree"
+    n = subprocess.check_output(["git", "-C", str(tree), "rev-list", "--count", "HEAD"], text=True)
+    assert n.strip() == "1"
+    for nb in ("leaky", "clean"):
+        assert json.loads((tree / ("notebooks/%s.ipynb" % nb)).read_text())["cells"][0]["outputs"] == []
+
+
+def test_release_real_missing_license_refuses(tmp_path):
+    rc, out = _rel(tmp_path)
+    assert rc == 2 and not (out / "nexus-lite-v1.2.3.bundle").exists()
+
+
+def test_release_bad_version(tmp_path):
+    rc, out = _rel(tmp_path, version="1.2")
+    assert rc == 2 and not out.exists()
+
+
+def test_release_leak_hit_rc1(tmp_path):
+    rc, out = _rel(tmp_path, extra={"nexus_lite/b.py": "u='" + HOST + "'\n", "LICENSE": "MIT\n"},
+                   cfg={"allowlist": CFG["allowlist"] + ["LICENSE"]})
+    assert rc == 1 and not (out / "nexus-lite-v1.2.3.bundle").exists()

@@ -167,6 +167,7 @@ def bus_send(
     and if target (or ALL) has a live dtach socket, injects:
     '[nexus] <kind> <msg_id> <path> - <summary>' into the PTY.
     """
+    init()
     ws = get_workspace()
     (ws / "inbox").mkdir(parents=True, exist_ok=True)
 
@@ -446,7 +447,10 @@ def delegate(    agent_cmd: str,
     - Updates SQLite tasks table
     - Sends TASK_COMPLETE notification to caller via bus_send
     """
-    current_depth = int(os.environ.get("NEXUS_DELEGATION_DEPTH", "0"))
+    try:
+        current_depth = int(os.environ.get("NEXUS_DELEGATION_DEPTH") or 0)
+    except ValueError:
+        current_depth = 0
     if current_depth >= 2:
         raise PermissionError(
             f"NEXUS_DELEGATION_DEPTH exceeded (current depth {current_depth} >= max 2)"

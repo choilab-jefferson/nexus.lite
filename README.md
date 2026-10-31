@@ -261,9 +261,20 @@ print(r.status, r.ok)               # "unavailable" when loom is not installed
 
 Exit codes map to `ok`, `task_failure` (retryable), `harness_or_policy_error`, `escalation_required`, `budget`, `interrupted`, else `unknown`; `loom capabilities --json` overrides the built-in table. Install path is TBD (`LOOM_INSTALL_URL`).
 
+The loom subprocess gets an env allowlist, not your full environment: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `LOOM_*`, and provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `OLLAMA_HOST`). Add more with `LoomAdapter(env_passthrough=[...])`.
+`probe().version` reads the `version` capability (None for older binaries). `version_ok` is False below `MIN_LOOM_VERSION` (0.1.0), and `probe()` then emits a warning; unknown or unparseable versions are accepted.
+
 ## Acknowledgements
 
 We gratefully acknowledge **Google** for providing **Gemini 4 Argon** access and support, which powered the multi-agent orchestration, quantitative radiomics synthesis, and automated methodological auditing across `nexus-lite`, [`qradiomics`](https://github.com/choilab-jefferson/qradiomics), and [`medimage`](https://github.com/choilab-jefferson/medimage).
 
 *Computational Healthcare & Oncology Informatics (CHOI) Lab, Department of Radiation Oncology, Sidney Kimmel Medical College at Thomas Jefferson University* · MIT License
 
+
+## Releasing
+
+Releases are squash-commit snapshots (one per release, history kept) pushed to GitHub by a maintainer; see [docs/RELEASE.md](docs/RELEASE.md).
+
+## loom multi-agent on Colab
+
+`notebooks/loom_multi_agent_colab.ipynb` (or `python -m nexus_lite.loom_multi_agent`) installs loom from a checksum-verified release (source-build fallback) and runs a 5-role orchestrator/worker/reviewer example. Keys come only from Colab Secrets (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`); with none set it uses the offline `mock` provider.
