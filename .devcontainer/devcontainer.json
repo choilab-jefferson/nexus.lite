@@ -1,0 +1,27 @@
+{
+  "name": "Nexus-Lite Dev Container",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y dtach && pip install -e .[dev]",
+  "forwardPorts": [8765],
+  "portsAttributes": {
+    "8765": {
+      "label": "Nexus-Lite Live Dashboard & Bridge",
+      "onAutoForward": "notify"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.testing.pytestArgs": [
+          "tests"
+        ],
+        "python.testing.unittestEnabled": false,
+        "python.testing.pytestEnabled": true
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ]
+    }
+  }
+}

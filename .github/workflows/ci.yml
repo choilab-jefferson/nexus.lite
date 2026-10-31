@@ -1,0 +1,40 @@
+name: Nexus-Lite & QRadiomics CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  test-colab-sim-and-demos:
+    name: Pytest (Core + Fake Colab/Drive Sync + QRadiomics Demos)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system dtach for persistent PTY sessions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dtach
+
+      - name: Install nexus-lite, qradiomics, and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,demos]" "pydantic>=2.7" "git+https://github.com/choilab-jefferson/qradiomics.git"
+
+      - name: Run Core & Fake Colab/Google Drive Sync Tests
+        run: |
+          pytest -v tests/test_nexus_lite.py
+
+      - name: Run QRadiomics + MedImage Multi-Agent Demo & Colab Simulation Tests
+        run: |
+          pytest -v tests/test_qradiomics_medimage_demos.py -k "not test_live_agy"

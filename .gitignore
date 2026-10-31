@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+.nexus/
+*.sock
+*.sock.*
+*.egg-info/
+build/
+dist/
+.worktrees/

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexus-lite"
+version = "0.1.4"
+description = "Ultra-simple Colab-ready multi-agent primitives for Nexus"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyte>=0.8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+demos = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pydicom>=2.4.0",
+    "SimpleITK>=2.3.0",
+]
+
+[project.scripts]
+nexus-lite = "nexus_lite.cli:main"
+
+[tool.setuptools]
+packages = ["nexus_lite"]
