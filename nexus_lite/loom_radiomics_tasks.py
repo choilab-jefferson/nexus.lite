@@ -1,9 +1,10 @@
 """Radiomics tasks for the loom multi-agent example (pluggable via `--task NAME`).
 
-Three tasks, each with 3-4 independent flat modules, IBSI-flavoured but unambiguous edge cases:
+Four tasks, each with 3-4 independent flat modules, IBSI-flavoured with unambiguous edge cases:
   radiomics-firstorder  discretisation, ROI masking + re-segmentation, first-order features
   radiomics-texture     2D GLCM + features, GLRLM + features (mask-aware)
   radiomics-stats       ICC(3,1), Benjamini-Hochberg q-values, train-only z-score, Harrell's C-index
+  radiomics-suv         IBSI-SUV v3.1 body normalisation, decay/t_ave, unit conversion, IPP z-stacking
 
 Every task object exposes NAME, SPEC, FILES, GOALS, DEFAULT_SPLIT, MOCK_FILES {file: (flawed, good)},
 HIDDEN_TESTS {test_file: src}, HIDDEN_TOTAL. Every edge case the hidden tests check is stated in SPEC.
@@ -1171,5 +1172,432 @@ def test_errors():
 }
 STATS = _task("radiomics-stats", _ST_SPEC, _ST_GOALS, _ST_TEMPLATES, _ST_FLAWS, _ST_HIDDEN)
 
-TASKS = {t.NAME: t for t in (FIRSTORDER, TEXTURE, STATS)}
+# ====================================================================== radiomics-suv (IBSI-SUV v3.1)
+_SUV_SPEC = (
+    "Build four small, independent python modules implementing the IBSI-SUV v3.1 reference standard, "
+    "all flat in one directory (no packages, stdlib only).\n"
+    "1) suv_body.py: patient_weight_g(weight) converts patient weight to grams: weight <= 0 raises ValueError; "
+    "if weight >= 1000.0 it is already in grams and returned as float(weight), otherwise float(weight) * 1000.0. "
+    "patient_height_cm(height_m) converts height in metres to cm: height_m <= 0 raises ValueError, returns float(height_m) * 100.0. "
+    "body_norm_factor_g(weight, height_m=None, sex=None, suv_type='BW') returns the IBSI-SUV v3.1 body-size factor in grams "
+    "(or cm^2 for BSA): st = suv_type.strip().upper(); for st in ('', 'BW') only weight is needed and returns patient_weight_g(weight). "
+    "All other types require height_m (missing/None or <= 0 raises ValueError) with h_cm = patient_height_cm(height_m) and w_kg = patient_weight_g(weight) / 1000.0. "
+    "For st == 'BSA' return 0.007184 * (h_cm ** 0.725) * (w_kg ** 0.425) * 10000.0 (sex not required). "
+    "For st in ('LBM', 'LBMJAMES128', 'LBMJANMA', 'IBW'), sex is required and sex.strip().upper() must be in ('M', 'F', 'O') else ValueError: "
+    "LBM: m = 1.10*w_kg - 120.0*(w_kg/h_cm)**2, f = 1.07*w_kg - 148.0*(w_kg/h_cm)**2; "
+    "LBMJAMES128: m = 1.10*w_kg - 128.0*(w_kg/h_cm)**2, f = 1.07*w_kg - 148.0*(w_kg/h_cm)**2; "
+    "LBMJANMA: bmi = w_kg / ((h_cm * 0.01) ** 2), m = (9270.0*w_kg)/(6680.0 + 216.0*bmi), f = (9270.0*w_kg)/(8780.0 + 244.0*bmi); "
+    "IBW: m = 48.0 + 1.06*(h_cm - 152.0), f = 45.5 + 0.91*(h_cm - 152.0); "
+    "if sex is 'M' choose m, 'F' choose f, 'O' choose 0.5*(m + f), and return chosen * 1000.0. Any other suv_type raises ValueError.\n"
+    "2) suv_decay.py: effective_dose_bq(dose) validates injected dose: dose <= 0 raises ValueError; if dose < 1e4 it is in MBq "
+    "so return float(dose) * 1e6, else float(dose). frame_average_offset_s(frame_duration_ms, half_life_s) computes IBSI-SUV t_ave in seconds: "
+    "frame_duration_ms <= 0 or half_life_s <= 0 raises ValueError; T = frame_duration_ms / 1000.0, lam = ln(2) / half_life_s, "
+    "return (1.0 / lam) * ln((lam * T) / (1.0 - exp(-lam * T))). decayed_dose_bq(dose, elapsed_s, half_life_s) validates dose via effective_dose_bq "
+    "and half_life_s > 0 (else ValueError) and returns effective_dose_bq(dose) * exp(-ln(2) * elapsed_s / half_life_s). "
+    "resolve_elapsed_s(decay_correction, acq_s, admin_s, series_s=None, frame_ref_ms=None, frame_dur_ms=None, half_life_s=6588.0, manufacturer='') "
+    "returns the decay time (t_ref - t_adm) in seconds: dc = decay_correction.strip().upper(); if dc == 'ADMIN' return 0.0; "
+    "if dc == 'NONE' require frame_dur_ms > 0 and half_life_s > 0 (else ValueError) and t_ref = acq_s + frame_average_offset_s(frame_dur_ms, half_life_s); "
+    "if dc == 'START': if series_s is not None and abs(acq_s - series_s) <= 1.0 then t_ref = acq_s; else require frame_ref_ms is not None and frame_ref_ms >= 0 "
+    "(else ValueError), and if 'GE' in manufacturer.upper() then t_ref = acq_s - frame_ref_ms / 1000.0, else require frame_dur_ms > 0 and "
+    "t_ref = acq_s + frame_average_offset_s(frame_dur_ms, half_life_s) - frame_ref_ms / 1000.0; any other dc raises ValueError. "
+    "Finally diff = t_ref - admin_s; if diff < -3600.0 add 86400.0 (midnight crossing); if diff < -3600.0 or diff >= 2.0 * half_life_s raise ValueError; return diff.\n"
+    "3) suv_convert.py: rescale_slice(raw_2d, slope, intercept) takes a non-empty rectangular 2D list of numbers and returns a 2D list of floats "
+    "x * slope + intercept; empty/ragged raw_2d or slope == 0 raises ValueError. philips_cnts_to_suvbw(rescaled_2d, weight_g, decayed_dose, "
+    "act_factor=0.0, suv_factor=0.0, manufacturer='PHILIPS') converts Philips CNTS: if 'PHILIPS' not in manufacturer.upper() or weight_g <= 0 or decayed_dose <= 0 "
+    "raise ValueError; if act_factor > 0.0 scale every pixel by act_factor * (weight_g / decayed_dose); elif suv_factor > 0.0 scale every pixel by suv_factor; "
+    "else raise ValueError.\n"
+    "4) suv_qc.py: sort_slices_by_z(slices) takes a non-empty list of dicts each having 'image' (2D list) and optional 'ipp_z' (float/None) and 'slice_location' (float/None). "
+    "For each slice use 'ipp_z' if not None, else 'slice_location' if not None, else raise ValueError (prioritising ImagePositionPatient[2] over SliceLocation). "
+    "Duplicate z values or empty slices raise ValueError. Return [s['image'] for s in sorted_by_z_ascending]. "
+    "roi_suv_metrics(vol_3d, mask_3d) extracts all voxel values where mask_3d == 1 (matching 3D shapes required, mask values must be int 0 or 1, at least one 1 required, else ValueError) "
+    "and returns {'min': float, 'median': float, 'max': float, 'mean': float} where median is the average of the two middle values for even counts."
+)
+_SUV_GOALS = {
+    "suv_body.py": "patient_weight_g (>=1000g rule), patient_height_cm, body_norm_factor_g (BW/LBM/LBMJAMES128/LBMJANMA/IBW/BSA)",
+    "suv_decay.py": "effective_dose_bq (<1e4 MBq rule), frame_average_offset_s, decayed_dose_bq, resolve_elapsed_s (ADMIN/START/NONE)",
+    "suv_convert.py": "rescale_slice (non-zero slope, rectangular 2D), philips_cnts_to_suvbw (act_factor priority over suv_factor)",
+    "suv_qc.py": "sort_slices_by_z (ipp_z priority over slice_location), roi_suv_metrics (min/median/max/mean)",
+}
+_SUV_TEMPLATES = {
+    "suv_body.py": '''def patient_weight_g(weight):
+    if weight is None or weight <= 0:
+        raise ValueError("weight must be > 0")
+    w = float(weight)
+    return w if w >= @@GRAM_THRESHOLD@@ else w * 1000.0
+
+
+def patient_height_cm(height_m):
+    if height_m is None or height_m <= 0:
+        raise ValueError("height_m must be > 0")
+    return float(height_m) * 100.0
+
+
+def body_norm_factor_g(weight, height_m=None, sex=None, suv_type="BW"):
+    st = (suv_type or "").strip().upper()
+    w_g = patient_weight_g(weight)
+    if st in ("", "BW"):
+        return w_g
+    h_cm = patient_height_cm(height_m)
+    w_kg = w_g / 1000.0
+    if st == "BSA":
+        return 0.007184 * (h_cm ** 0.725) * (w_kg ** 0.425) * 10000.0
+    if sex is None or str(sex).strip().upper() not in ("M", "F", "O"):
+        raise ValueError("valid sex required")
+    sx = str(sex).strip().upper()
+    if st == "LBM":
+        m = 1.10 * w_kg - 120.0 * ((w_kg / h_cm) ** 2)
+        f = 1.07 * w_kg - 148.0 * ((w_kg / h_cm) ** 2)
+    elif st == "LBMJAMES128":
+        m = 1.10 * w_kg - 128.0 * ((w_kg / h_cm) ** 2)
+        f = 1.07 * w_kg - 148.0 * ((w_kg / h_cm) ** 2)
+    elif st == "LBMJANMA":
+        bmi = w_kg / ((h_cm * 0.01) ** 2)
+        m = (9270.0 * w_kg) / (6680.0 + 216.0 * bmi)
+        f = (9270.0 * w_kg) / (8780.0 + 244.0 * bmi)
+    elif st == "IBW":
+        m = 48.0 + 1.06 * (h_cm - 152.0)
+        f = 45.5 + 0.91 * (h_cm - 152.0)
+    else:
+        raise ValueError(f"unsupported suv_type: {st}")
+    val = m if sx == "M" else (f if sx == "F" else 0.5 * (m + f))
+    return val * 1000.0
+''',
+    "suv_decay.py": '''import math
+
+
+def effective_dose_bq(dose):
+    if dose is None or dose <= 0:
+        raise ValueError("dose must be > 0")
+    d = float(dose)
+    return d * @@MBQ_SCALE@@ if d < 1e4 else d
+
+
+def frame_average_offset_s(frame_duration_ms, half_life_s):
+    if frame_duration_ms is None or frame_duration_ms <= 0 or half_life_s is None or half_life_s <= 0:
+        raise ValueError("duration and half_life must be > 0")
+    t_s = float(frame_duration_ms) / 1000.0
+    lam = math.log(2.0) / float(half_life_s)
+    return (1.0 / lam) * math.log((lam * t_s) / (1.0 - math.exp(-lam * t_s)))
+
+
+def decayed_dose_bq(dose, elapsed_s, half_life_s):
+    if half_life_s is None or half_life_s <= 0:
+        raise ValueError("half_life_s must be > 0")
+    d = effective_dose_bq(dose)
+    return d * math.exp(-math.log(2.0) * float(elapsed_s) / float(half_life_s))
+
+
+def resolve_elapsed_s(
+    decay_correction,
+    acq_s,
+    admin_s,
+    series_s=None,
+    frame_ref_ms=None,
+    frame_dur_ms=None,
+    half_life_s=6588.0,
+    manufacturer="",
+):
+    dc = (decay_correction or "").strip().upper()
+    if dc == "ADMIN":
+        return 0.0
+    if half_life_s is None or half_life_s <= 0:
+        raise ValueError("half_life_s must be > 0")
+    if dc == "NONE":
+        if frame_dur_ms is None or frame_dur_ms <= 0:
+            raise ValueError("frame_dur_ms required for NONE")
+        t_ref = float(acq_s) + frame_average_offset_s(frame_dur_ms, half_life_s)
+    elif dc == "START":
+        if series_s is not None and abs(float(acq_s) - float(series_s)) <= 1.0:
+            t_ref = float(acq_s)
+        else:
+            if frame_ref_ms is None or frame_ref_ms < 0:
+                raise ValueError("non-negative frame_ref_ms required")
+            if "GE" in (manufacturer or "").upper():
+                t_ref = float(acq_s) - float(frame_ref_ms) / 1000.0
+            else:
+                if frame_dur_ms is None or frame_dur_ms <= 0:
+                    raise ValueError("frame_dur_ms required for non-GE START")
+                t_ref = (
+                    float(acq_s)
+                    + frame_average_offset_s(frame_dur_ms, half_life_s)
+                    - float(frame_ref_ms) / 1000.0
+                )
+    else:
+        raise ValueError(f"invalid decay_correction: {dc}")
+    diff = t_ref - float(admin_s)
+    if diff < -3600.0:
+        diff += 86400.0
+    if diff < -3600.0 or diff >= 2.0 * float(half_life_s):
+        raise ValueError("elapsed time out of IBSI-SUV bounds")
+    return diff
+''',
+    "suv_convert.py": '''def rescale_slice(raw_2d, slope, intercept):
+    if not isinstance(raw_2d, list) or not raw_2d or not isinstance(raw_2d[0], list) or not raw_2d[0]:
+        raise ValueError("raw_2d must be non-empty 2D list")
+    if slope is None or float(slope) == 0.0:
+        raise ValueError("slope must be non-zero")
+    cols = len(raw_2d[0])
+    s = float(slope)
+    b = float(intercept)
+    out = []
+    for row in raw_2d:
+        if not isinstance(row, list) or len(row) != cols:
+            raise ValueError("ragged 2D list")
+        out.append([float(x) * s + b for x in row])
+    return out
+
+
+def philips_cnts_to_suvbw(
+    rescaled_2d,
+    weight_g,
+    decayed_dose,
+    act_factor=0.0,
+    suv_factor=0.0,
+    manufacturer="PHILIPS",
+):
+    if "PHILIPS" not in (manufacturer or "").upper():
+        raise ValueError("CNTS only valid for Philips")
+    if weight_g is None or weight_g <= 0 or decayed_dose is None or decayed_dose <= 0:
+        raise ValueError("weight_g and decayed_dose must be > 0")
+    af = float(act_factor or 0.0)
+    sf = float(suv_factor or 0.0)
+    if af > 0.0:
+        scale = af * (float(weight_g) / float(decayed_dose))
+    elif sf > 0.0:
+        scale = sf
+    else:
+        raise ValueError("missing Philips scale factors")
+    return rescale_slice(rescaled_2d, scale, 0.0)
+''',
+    "suv_qc.py": '''def sort_slices_by_z(slices):
+    if not isinstance(slices, list) or not slices:
+        raise ValueError("slices must be non-empty list")
+    keyed = []
+    seen_z = set()
+    for s in slices:
+        if not isinstance(s, dict) or "image" not in s:
+            raise ValueError("invalid slice entry")
+        z = s.get("ipp_z")
+        if z is None:
+            z = s.get("slice_location")
+        if z is None:
+            raise ValueError("missing z coordinate")
+        zf = float(z)
+        if zf in seen_z:
+            raise ValueError("duplicate z coordinate")
+        seen_z.add(zf)
+        keyed.append((zf, s["image"]))
+    keyed.sort(key=lambda item: item[0])
+    return [img for _, img in keyed]
+
+
+def roi_suv_metrics(vol_3d, mask_3d):
+    if not isinstance(vol_3d, list) or not isinstance(mask_3d, list) or not vol_3d or len(vol_3d) != len(mask_3d):
+        raise ValueError("invalid 3D inputs")
+    vals = []
+    for z_idx, (v_slice, m_slice) in enumerate(zip(vol_3d, mask_3d)):
+        if not isinstance(v_slice, list) or not isinstance(m_slice, list) or not v_slice or len(v_slice) != len(m_slice):
+            raise ValueError("slice shape mismatch")
+        for v_row, m_row in zip(v_slice, m_slice):
+            if not isinstance(v_row, list) or not isinstance(m_row, list) or not v_row or len(v_row) != len(m_row):
+                raise ValueError("row shape mismatch")
+            for v, m in zip(v_row, m_row):
+                if type(m) is not int or m not in (0, 1):
+                    raise ValueError("mask must be int 0 or 1")
+                if m == 1:
+                    vals.append(float(v))
+    if not vals:
+        raise ValueError("empty ROI")
+    vals.sort()
+    n = len(vals)
+    med = vals[n // 2] if n % 2 == 1 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+    return {
+        "min": vals[0],
+        "median": med,
+        "max": vals[-1],
+        "mean": sum(vals) / n,
+    }
+''',
+}
+_SUV_FLAWS = {
+    "suv_body.py": ("@@GRAM_THRESHOLD@@", "1000.0", "100000.0"),
+    "suv_decay.py": ("@@MBQ_SCALE@@", "1e6", "1.0"),
+}
+_SUV_HIDDEN = {
+    "test_h_suv_body.py": '''import pytest
+from suv_body import patient_weight_g, patient_height_cm, body_norm_factor_g
+
+
+def test_weight_kg_and_grams():
+    assert patient_weight_g(75.0) == pytest.approx(75000.0)
+    assert patient_weight_g(75000.0) == pytest.approx(75000.0)
+
+
+def test_height_cm():
+    assert patient_height_cm(1.75) == pytest.approx(175.0)
+
+
+def test_bw_case_insensitive_and_blank():
+    assert body_norm_factor_g(80.0, suv_type="bw") == pytest.approx(80000.0)
+    assert body_norm_factor_g(80.0, suv_type="") == pytest.approx(80000.0)
+
+
+def test_bw_and_bsa():
+    assert body_norm_factor_g(75.0, suv_type="BW") == pytest.approx(75000.0)
+    assert body_norm_factor_g(75.0, 1.75, suv_type="BSA") == pytest.approx(
+        0.007184 * (175.0 ** 0.725) * (75.0 ** 0.425) * 10000.0
+    )
+
+
+def test_lbm_variants_and_ibw():
+    assert body_norm_factor_g(75.0, 1.75, "M", "LBM") == pytest.approx(
+        (1.10 * 75.0 - 120.0 * (75.0 / 175.0) ** 2) * 1000.0
+    )
+    assert body_norm_factor_g(75.0, 1.75, "F", "LBMJAMES128") == pytest.approx(
+        (1.07 * 75.0 - 148.0 * (75.0 / 175.0) ** 2) * 1000.0
+    )
+    bmi = 75.0 / (1.75 ** 2)
+    assert body_norm_factor_g(75.0, 1.75, "M", "LBMJANMA") == pytest.approx(
+        ((9270.0 * 75.0) / (6680.0 + 216.0 * bmi)) * 1000.0
+    )
+    m_ibw = (48.0 + 1.06 * 23.0) * 1000.0
+    f_ibw = (45.5 + 0.91 * 23.0) * 1000.0
+    assert body_norm_factor_g(75.0, 1.75, "O", "IBW") == pytest.approx(0.5 * (m_ibw + f_ibw))
+
+
+def test_body_errors():
+    for bad_w in (0, -5, None):
+        with pytest.raises(ValueError):
+            patient_weight_g(bad_w)
+    with pytest.raises(ValueError):
+        body_norm_factor_g(75.0, None, "M", "LBM")
+    with pytest.raises(ValueError):
+        body_norm_factor_g(75.0, 1.75, "X", "LBM")
+    with pytest.raises(ValueError):
+        body_norm_factor_g(75.0, 1.75, "M", "UNKNOWN")
+''',
+    "test_h_suv_decay.py": '''import math
+import pytest
+from suv_decay import effective_dose_bq, frame_average_offset_s, decayed_dose_bq, resolve_elapsed_s
+
+
+def test_effective_dose_mbq_and_bq():
+    assert effective_dose_bq(300.0) == pytest.approx(300_000_000.0)
+    assert effective_dose_bq(300_000_000.0) == pytest.approx(300_000_000.0)
+
+
+def test_frame_average_offset():
+    lam = math.log(2.0) / 6588.0
+    expected = (1.0 / lam) * math.log((lam * 300.0) / (1.0 - math.exp(-lam * 300.0)))
+    assert frame_average_offset_s(300000.0, 6588.0) == pytest.approx(expected)
+
+
+def test_decayed_dose():
+    assert decayed_dose_bq(300.0, 6588.0, 6588.0) == pytest.approx(150_000_000.0)
+
+
+def test_resolve_elapsed_series_equals_acq():
+    assert resolve_elapsed_s("START", 4200.5, 600.0, series_s=4200.0) == pytest.approx(3600.5)
+
+
+def test_resolve_elapsed_admin_none_start():
+    assert resolve_elapsed_s("ADMIN", 5000.0, 1000.0) == 0.0
+    t_ave = frame_average_offset_s(300000.0, 6588.0)
+    assert resolve_elapsed_s("NONE", 3600.0, 0.0, frame_dur_ms=300000.0, half_life_s=6588.0) == pytest.approx(3600.0 + t_ave)
+    assert resolve_elapsed_s("START", 4200.0, 600.0, frame_ref_ms=600000.0, manufacturer="GE MEDICAL SYSTEMS") == pytest.approx(3000.0)
+    assert resolve_elapsed_s("START", 4200.0, 600.0, frame_ref_ms=600000.0, frame_dur_ms=300000.0, manufacturer="SIEMENS") == pytest.approx(3000.0 + t_ave)
+
+
+def test_midnight_crossing_and_errors():
+    assert resolve_elapsed_s("START", 600.0, 86400.0 - 3000.0, series_s=600.0, half_life_s=6588.0) == pytest.approx(3600.0)
+    with pytest.raises(ValueError):
+        effective_dose_bq(0)
+    with pytest.raises(ValueError):
+        resolve_elapsed_s("START", 20000.0, 0.0, series_s=20000.0, half_life_s=6588.0)
+''',
+    "test_h_suv_convert.py": '''import pytest
+from suv_convert import rescale_slice, philips_cnts_to_suvbw
+
+
+def test_rescale_slice():
+    assert rescale_slice([[1, 2], [3, 4]], 2.5, -1.0) == [[1.5, 4.0], [6.5, 9.0]]
+
+
+def test_rescale_negative_slope():
+    assert rescale_slice([[2.0, -4.0]], -0.5, 1.0) == [[0.0, 3.0]]
+
+
+def test_philips_activity_factor_priority():
+    out = philips_cnts_to_suvbw([[10.0, 20.0]], 75000.0, 150_000_000.0, act_factor=2.0, suv_factor=99.0)
+    assert out[0] == pytest.approx([0.01, 0.02])
+
+
+def test_philips_suv_factor_fallback():
+    out = philips_cnts_to_suvbw([[10.0, 20.0]], 75000.0, 150_000_000.0, act_factor=0.0, suv_factor=0.005)
+    assert out[0] == pytest.approx([0.05, 0.10])
+
+
+def test_convert_errors():
+    with pytest.raises(ValueError):
+        rescale_slice([], 1.0, 0.0)
+    with pytest.raises(ValueError):
+        rescale_slice([[1, 2], [3]], 1.0, 0.0)
+    with pytest.raises(ValueError):
+        rescale_slice([[1, 2]], 0.0, 0.0)
+    with pytest.raises(ValueError):
+        philips_cnts_to_suvbw([[1.0]], 75000.0, 150_000_000.0, act_factor=2.0, manufacturer="SIEMENS")
+    with pytest.raises(ValueError):
+        philips_cnts_to_suvbw([[1.0]], 75000.0, 150_000_000.0, act_factor=0.0, suv_factor=0.0)
+''',
+    "test_h_suv_qc.py": '''import pytest
+from suv_qc import sort_slices_by_z, roi_suv_metrics
+
+
+def test_sort_slices_prioritizes_ipp_z_over_slice_location():
+    slices = [
+        {"image": [[2]], "ipp_z": 1406.7, "slice_location": -1406.7},
+        {"image": [[1]], "ipp_z": 1400.0, "slice_location": -1400.0},
+    ]
+    assert sort_slices_by_z(slices) == [[[1]], [[2]]]
+
+
+def test_sort_slices_falls_back_to_slice_location():
+    slices = [
+        {"image": [[20]], "ipp_z": None, "slice_location": 10.0},
+        {"image": [[10]], "ipp_z": None, "slice_location": -5.0},
+    ]
+    assert sort_slices_by_z(slices) == [[[10]], [[20]]]
+
+
+def test_roi_suv_metrics_dro_reference():
+    vol = [[[[0.2, 1.0], [4.0, 99.0]]][0]]
+    msk = [[[[1, 1], [1, 0]]][0]]
+    res = roi_suv_metrics(vol, msk)
+    assert res["min"] == pytest.approx(0.2)
+    assert res["median"] == pytest.approx(1.0)
+    assert res["max"] == pytest.approx(4.0)
+    assert res["mean"] == pytest.approx((0.2 + 1.0 + 4.0) / 3.0)
+
+
+def test_roi_suv_metrics_even_median():
+    vol = [[[1.0, 2.0], [4.0, 9.0]]]
+    msk = [[[1, 1], [1, 1]]]
+    res = roi_suv_metrics(vol, msk)
+    assert res["median"] == pytest.approx(3.0)
+
+
+def test_qc_errors():
+    with pytest.raises(ValueError):
+        sort_slices_by_z([])
+    with pytest.raises(ValueError):
+        sort_slices_by_z([{"image": [[1]], "ipp_z": 1.0}, {"image": [[2]], "ipp_z": 1.0}])
+    with pytest.raises(ValueError):
+        roi_suv_metrics([[[1.0]]], [[[0]]])
+    with pytest.raises(ValueError):
+        roi_suv_metrics([[[1.0]]], [[[True]]])
+''',
+}
+SUV = _task("radiomics-suv", _SUV_SPEC, _SUV_GOALS, _SUV_TEMPLATES, _SUV_FLAWS, _SUV_HIDDEN)
+
+TASKS = {t.NAME: t for t in (FIRSTORDER, TEXTURE, STATS, SUV)}
 DEFAULT_TASKS = ",".join(TASKS)

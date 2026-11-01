@@ -6,7 +6,7 @@ import pytest
 from nexus_lite import loom_multi_agent as m
 from nexus_lite.loom_radiomics_tasks import TASKS
 
-NAMES = ["radiomics-firstorder", "radiomics-texture", "radiomics-stats"]
+NAMES = ["radiomics-firstorder", "radiomics-texture", "radiomics-stats", "radiomics-suv"]
 
 
 def _quiet(*_a, **_k):

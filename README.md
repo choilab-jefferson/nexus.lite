@@ -288,9 +288,10 @@ Same orchestrator/worker/reviewer framework, pluggable tasks (`--task NAME[,NAME
 | `radiomics-firstorder` | discretise, roi, moments, distribution (bins, ROI + re-segmentation, mean/variance/skew/kurtosis/energy/entropy/rMAD) |
 | `radiomics-texture` | glcm, glcm_features, glrlm, glrlm_features |
 | `radiomics-stats` | icc (ICC 3,1), fdr (BH q-values), standardise (train-only z-score), cindex (Harrell C) |
+| `radiomics-suv` | suv_body, suv_decay, suv_convert, suv_qc (IBSI-SUV v3.1 body normalisation, decay/t_ave, Philips CNTS & unit conversion, IPP z-stacking) |
 
 ```bash
-python examples/loom_radiomics.py --providers mock            # all three, offline scripted
-python examples/loom_radiomics.py --task radiomics-stats --providers anthropic,gemini --json-out out.json
+python examples/loom_radiomics.py --providers mock            # all four, offline scripted
+python examples/loom_radiomics.py --task radiomics-suv --providers anthropic,gemini --json-out out.json
 python -m nexus_lite.loom_multi_agent --task radiomics-texture --providers mock
 ```

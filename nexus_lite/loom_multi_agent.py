@@ -603,7 +603,7 @@ def to_json(result, loomv: str = "") -> dict:
     return d
 
 
-_RADIOMICS_NAMES = ("radiomics-firstorder", "radiomics-texture", "radiomics-stats")
+_RADIOMICS_NAMES = ("radiomics-firstorder", "radiomics-texture", "radiomics-stats", "radiomics-suv")
 
 
 def _kv(items, what):
