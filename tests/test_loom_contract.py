@@ -1,7 +1,7 @@
 """Contract test against a REAL loom binary.
 
 Skipped when no binary is found (LOOM_BIN, else PATH). The pinned constants
-below mirror nexus.loom docs/contract.md; bump them together with that doc.
+below mirror the loom contract doc (docs/contract.md in the loom repo); bump them together.
 """
 import json
 import os

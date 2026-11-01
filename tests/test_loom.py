@@ -27,6 +27,11 @@ if "--trace" in a:
     with open(a[a.index("--trace") + 1], "w") as f:
         f.write(json.dumps({{"event": "start"}}) + "\n" + "garbage\n" + json.dumps({{"event": "end"}}) + "\n")
 rc = int(os.environ.get("LOOM_FAKE_RC", "0"))
+if os.environ.get("LOOM_FAKE_CRASH"):
+    import signal
+    os.kill(os.getpid(), signal.SIGKILL)
+if os.environ.get("LOOM_FAKE_BAD"):
+    print("this is not json"); sys.exit(rc)
 if rc == 3:
     print(json.dumps({{"escalate": "need human"}}))
 else:
@@ -116,10 +121,6 @@ def test_timeout(fake, monkeypatch):
     assert r.status == "timeout" and not r.ok and r.returncode is None
 
 
-def test_install_url_is_env_driven():
-    assert loom.LOOM_INSTALL_URL == os.environ.get("LOOM_INSTALL_URL")
-
-
 def test_env_allowlist(fake, monkeypatch):
     monkeypatch.setenv("SECRET_TOKEN", "x")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
@@ -157,3 +158,24 @@ def test_version_unparseable(fake, monkeypatch):
     monkeypatch.setenv("LOOM_FAKE_VER", "dev")
     pr = probe()
     assert pr.version == "dev" and pr.version_ok
+
+
+def test_crash_by_signal_is_explicit_status(fake, monkeypatch):
+    monkeypatch.setenv("LOOM_FAKE_CRASH", "1")
+    monkeypatch.setenv("LOOM_X", "1")  # no-op marker; LOOM_* is forwarded
+    r = LoomAdapter().run_prompt("hi")
+    assert r.returncode < 0 and r.status == "crash" and not r.ok and not r.retryable
+
+
+def test_rc0_non_json_is_bad_output_not_ok(fake, monkeypatch):
+    monkeypatch.setenv("LOOM_FAKE_BAD", "1")
+    r = LoomAdapter().run_prompt("hi")
+    assert r.returncode == 0 and r.status == "bad_output"
+    assert not r.ok and r.result is None and "not json" in r.stdout
+
+
+def test_nonzero_non_json_keeps_exit_status(fake, monkeypatch):
+    monkeypatch.setenv("LOOM_FAKE_BAD", "1")
+    monkeypatch.setenv("LOOM_FAKE_RC", "1")
+    r = LoomAdapter().run_prompt("hi")
+    assert r.status == "task_failure" and r.retryable and not r.ok

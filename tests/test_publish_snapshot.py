@@ -4,6 +4,12 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
+_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "publish_snapshot.py"
+if not _SCRIPT.exists():   # scripts/ is not in the public snapshot
+    pytest.skip("scripts/publish_snapshot.py not exported", allow_module_level=True)
+
 SPEC = importlib.util.spec_from_file_location(
     "publish_snapshot", Path(__file__).resolve().parent.parent / "scripts" / "publish_snapshot.py")
 ps = importlib.util.module_from_spec(SPEC)

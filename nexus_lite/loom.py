@@ -15,8 +15,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-# TODO: path decided as github.com/choilab-jefferson/nexus.loom; the install URL
-# is pending a loom release tag. Set LOOM_INSTALL_URL meanwhile.
+# Install URL is pending a loom release tag. Set LOOM_INSTALL_URL meanwhile.
 LOOM_INSTALL_URL = os.environ.get("LOOM_INSTALL_URL")
 
 MIN_LOOM_VERSION = "0.1.0"
@@ -174,11 +173,14 @@ class LoomAdapter:
                               trace=_read_trace(trace_path))
         except OSError as e:
             return LoomResult(None, "unavailable", stderr=str(e), trace_path=trace_path)
-        status = self._status(p.returncode)
+        # rc<0: child killed by a signal (crash); not in loom's exit-code table.
+        status = "crash" if p.returncode < 0 else self._status(p.returncode)
         try:
             parsed = json.loads(p.stdout) if p.stdout.strip() else None
         except ValueError:
             parsed = None
+            if status == "ok" and p.stdout.strip():
+                status = "bad_output"  # rc=0 but stdout is not the JSON result
         return LoomResult(
             returncode=p.returncode, status=status, ok=status == "ok",
             retryable=status == "task_failure", result=parsed,

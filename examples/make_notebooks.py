@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Colab local-LLM swarm notebooks (T4 + A100/Pro)."""
+"""Generate the Colab notebooks: local-LLM swarms (T4 + A100/Pro) and the loom multi-agent build."""
 import json, pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -84,6 +84,39 @@ nbs["local_llm_swarm_colab_tiny.ipynb"] = build(
     "nexus-lite × Colab: tiny-model swarm (CPU or T4)", "T4 (or CPU runtime)",
     "Two tiny models (~1-3GB each) → 6 concurrent agents; works on a CPU runtime too, just slower.",
     ["lfm3:1.7b", "gemma4:e2b"], {"OLLAMA_NUM_PARALLEL": "6", "OLLAMA_MAX_LOADED_MODELS": "2"}, True, tiny=True)
+
+def loom_multi_agent_nb():
+    cells = [
+        md("# loom multi-agent build on Colab\n\n"
+           "Multi-agent is only justified where one agent cannot do the job in one shot, so this notebook compares both honestly. "
+           "An orchestrator splits a spec of four tricky python modules (tokenizer, intervals, TTL/LRU cache, money rounding) into "
+           "worker subtasks. Workers write files into a persistent sandbox with loom's `write_file` tool. The harness runs "
+           "**hidden** acceptance tests that live outside the sandbox and never appear in a prompt; workers only see failing "
+           "test names and failure kinds (up to 3 review rounds, so at most 2 rework rounds). A single agent gets the same spec and the same hidden "
+           "tests in one shot; its pass count is reported next to the multi-agent result.\n\n"
+           "A failed orchestrator, worker or reviewer fails the run (never PASS). Each agent retries a bounded number of times, "
+           "then falls back to the next provider; provider errors are summarised per agent with keys redacted.\n\n"
+           "Add `ANTHROPIC_API_KEY` and/or `GEMINI_API_KEY` in the Colab Secrets panel (key icon, enable notebook access) for real "
+           "models. Keys are read only via `google.colab.userdata`, passed to the loom child process, and never printed. "
+           "With no key the offline mock path runs: loom's mock provider cannot call tools, so the harness writes scripted file "
+           "payloads (two flawed modules fixed in round 2). Mock numbers are scripted, not evidence about any model."),
+        md("## 1. Install nexus-lite"),
+        code("!pip install -q git+https://github.com/choilab-jefferson/nexus.lite.git pytest"),
+        md("## 2. Run (auto: real providers if secrets exist, else mock)\nThe sandbox directory is kept and its path printed. "
+           "The first real run downloads loom (checksum-verified release, falls back to a source build). Add `--json-out run.json` "
+           "to keep rounds, per-agent status/time/error, hidden pass counts and baseline numbers."),
+        code("from nexus_lite.loom_multi_agent import main\nmain([])"),
+        md("Force the offline path: `main(['--providers', 'mock'])`. Failure injection, e.g. a wrong key for one worker so retry/fallback "
+           "run: `main(['--providers', 'anthropic,gemini', '--inject-bad-key', 'worker-2'])`; a short timeout: "
+           "`'--inject-timeout', 'reviewer=1'`. Repeat runs: `'--runs', '3'`. Baseline self-repair, reported separately: "
+           "`'--baseline-repair', '3'`."),
+    ]
+    return {"cells": cells, "metadata": {"language_info": {"name": "python"}, "colab": {"provenance": []},
+                                         "kernelspec": {"name": "python3", "display_name": "Python 3"}},
+            "nbformat": 4, "nbformat_minor": 5}
+
+
+nbs["loom_multi_agent_colab.ipynb"] = loom_multi_agent_nb()
 for n, nb in nbs.items():
     (OUT / n).write_text(json.dumps(nb, indent=1))
     print("wrote", n)

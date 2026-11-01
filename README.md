@@ -277,4 +277,20 @@ Releases are squash-commit snapshots (one per release, history kept) pushed to G
 
 ## loom multi-agent on Colab
 
-`notebooks/loom_multi_agent_colab.ipynb` (or `python -m nexus_lite.loom_multi_agent`) installs loom from a checksum-verified release (source-build fallback) and runs a 5-role orchestrator/worker/reviewer example. Keys come only from Colab Secrets (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`); with none set it uses the offline `mock` provider.
+`notebooks/loom_multi_agent_colab.ipynb` (or `python -m nexus_lite.loom_multi_agent`) installs loom from a checksum-verified release (source-build fallback) and builds four tricky modules with an orchestrator/worker/reviewer team scored by hidden tests, next to a single-agent baseline (`--json-out`, `--runs`, `--inject-bad-key`, `--inject-timeout`). Keys come only from Colab Secrets (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`); with none set it uses the offline `mock` provider.
+
+### Radiomics loom examples
+
+Same orchestrator/worker/reviewer framework, pluggable tasks (`--task NAME[,NAME...]|all`, default `basic`). Each radiomics task has 3-4 flat stdlib-only modules scored by hidden tests (never put in a prompt); images are nested lists, masks 0/1 lists.
+
+| task | modules |
+|------|---------|
+| `radiomics-firstorder` | discretise, roi, moments, distribution (bins, ROI + re-segmentation, mean/variance/skew/kurtosis/energy/entropy/rMAD) |
+| `radiomics-texture` | glcm, glcm_features, glrlm, glrlm_features |
+| `radiomics-stats` | icc (ICC 3,1), fdr (BH q-values), standardise (train-only z-score), cindex (Harrell C) |
+
+```bash
+python examples/loom_radiomics.py --providers mock            # all three, offline scripted
+python examples/loom_radiomics.py --task radiomics-stats --providers anthropic,gemini --json-out out.json
+python -m nexus_lite.loom_multi_agent --task radiomics-texture --providers mock
+```

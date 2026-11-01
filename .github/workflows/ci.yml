@@ -38,3 +38,7 @@ jobs:
       - name: Run QRadiomics + MedImage Multi-Agent Demo & Colab Simulation Tests
         run: |
           pytest -v tests/test_qradiomics_medimage_demos.py -k "not test_live_agy"
+
+      - name: Run loom adapter + multi-agent example tests (no loom binary, no API keys)
+        run: |
+          pytest -v tests/test_loom*.py
