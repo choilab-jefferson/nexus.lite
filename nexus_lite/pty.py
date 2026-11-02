@@ -30,6 +30,9 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
+from ._db import mark_session
+from ._proc import reap_in_background
+
 # dtach wire protocol constants
 MSG_PUSH = 0
 MSG_ATTACH = 1
@@ -155,6 +158,13 @@ def _winch_packet(rows: int, cols: int) -> bytes:
     return _PKT.pack(MSG_WINCH, 0, ws)
 
 
+# Public aliases (Gap G1, #21): nexus.code imports these; private names kept.
+PKT = _PKT
+PUSH_MAX = _PUSH_MAX
+packet = _packet
+winch_packet = _winch_packet
+
+
 def get_sock_dir() -> str:
     """Return socket directory from NEXUS_LITE_SOCK_DIR or default /tmp."""
     d = os.environ.get("NEXUS_LITE_SOCK_DIR", "/tmp")
@@ -230,8 +240,15 @@ def _probe_connect(path: str, timeout: float = 0.5) -> bool:
             pass
 
 
-def _find_dtach_pid(sock_path: str) -> Optional[int]:
-    """Find dtach process PID matching sock_path, preferring the master process with children."""
+def find_dtach_master_pid(sock_path: str) -> Optional[int]:
+    """PID of the dtach process that OWNS ``sock_path`` (its master, not a client).
+
+    Candidates: processes whose argv[0] basename is ``dtach`` and whose argv
+    carries ``sock_path`` as an EXACT token. Flags cannot tell master from
+    client (``-A`` appears on both), but only the master owns a child (the
+    inner PTY leader, ``/proc/<pid>/task/<pid>/children``). Exactly one
+    candidate with children wins; zero or several is ambiguous -> None. Never
+    guesses. Never raises."""
     matches: list[int] = []
     try:
         for cmdline_path in glob.glob("/proc/[0-9]*/cmdline"):
@@ -247,17 +264,21 @@ def _find_dtach_pid(sock_path: str) -> Optional[int]:
                 except (IndexError, ValueError):
                     continue
     except Exception:
-        pass
+        return None
 
+    with_children: list[int] = []
     for pid in matches:
         try:
             with open(f"/proc/{pid}/task/{pid}/children") as f:
-                if f.read().split():
-                    return pid
+                kids = f.read().split()
         except OSError:
             continue
+        if kids:
+            with_children.append(pid)
+    return with_children[0] if len(with_children) == 1 else None
 
-    return matches[0] if matches else None
+
+_find_dtach_pid = find_dtach_master_pid  # backward-compatible alias
 
 
 def _start_capture_worker(sp: str) -> None:
@@ -292,13 +313,13 @@ except Exception:
     pass
 """
     try:
-        subprocess.Popen(
+        reap_in_background(subprocess.Popen(
             [sys.executable, "-c", code],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
-        )
+        ))
     except Exception:
         pass
 
@@ -473,14 +494,14 @@ def spawn(
     argv = ["dtach", "-n", sp, "-z", "-r", "winch", shell, "-lc", inner]
 
     try:
-        subprocess.Popen(
+        reap_in_background(subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             env=env,
-        )
+        ))
     except OSError as e:
         raise RuntimeError(f"Failed to launch dtach: {e}") from e
 
@@ -518,6 +539,7 @@ def spawn(
             break
         time.sleep(0.02)
 
+    mark_session(name, True)  # lite#8: a (re)spawned name is live on the bus registry
     return name
 
 
@@ -676,74 +698,104 @@ def read(name: str, cols: int = CAPTURE_COLS, rows: int = CAPTURE_ROWS, settle: 
     return "\n".join(lines)
 
 
-def is_busy(text: str, provider: str = "") -> bool:
-    """Check if screen output indicates the agent or process is busy working."""
-    if not text:
-        return False
-    prov = provider.lower().strip()
-    has_spinner = any(s in text for s in SPINNERS)
+_SPIN = list(SPINNERS)
 
-    if prov == "claude":
-        return "esc to interrupt" in text or bool(CLAUDE_BUSY_RE.search(text)) or has_spinner
-    elif prov == "agy":
-        return (
-            "Analyzing…" in text
-            or "Generating" in text
-            or "esc to cancel" in text
-            or has_spinner
-        )
-    elif prov == "gemini":
-        return "Thinking…" in text or "esc to cancel" in text or has_spinner
-    elif prov == "copilot":
-        return "Working" in text or "esc cancel" in text or has_spinner
-    elif prov == "opencode":
-        return "Thinking…" in text or has_spinner
-    elif prov == "bash":
-        return False
-    else:
-        # Fallback heuristic
-        return (
-            has_spinner
-            or "Thinking…" in text
-            or "Analyzing…" in text
-            or "esc to interrupt" in text
-            or "esc to cancel" in text
-            or bool(CLAUDE_BUSY_RE.search(text))
-        )
+# Per-provider screen markers (pure text; ported from nexus.code
+# core/term/manifests/*.toml, lite's historic markers kept). Keys:
+#   needs_input: literals for a blocked dialog   busy/busy_re: working markers
+#   idle: literals marking the input prompt      idle_last_line: last line looks
+#   like a shell prompt                          idle_default: not-busy => idle
+# The "" entry is the fallback for unknown providers.
+PROVIDER_MANIFESTS: dict[str, dict] = {
+    "claude": {
+        "busy": ["esc to interrupt"] + _SPIN, "busy_re": [CLAUDE_BUSY_RE],
+        "idle": ["❯", "> "],
+    },
+    "agy": {
+        "needs_input": ["Do you trust the contents"],
+        "busy": ["Analyzing…", "Generating", "esc to cancel"] + _SPIN,
+        "idle": ["accept-edits", "❯", "> "], "idle_default": True,
+    },
+    "gemini": {
+        "needs_input": ["Do you trust the files in this folder?"],
+        "busy": ["Thinking…", "esc to cancel"] + _SPIN,
+        "idle": ["Type your message", "YOLO", "> "],
+    },
+    "copilot": {
+        "needs_input": ["Do you trust the files in this folder?",
+                        "Do you want to approve this request?"],
+        "busy": ["Working", "esc cancel"] + _SPIN,
+        "idle": ["Do you want to", "> ", "❯"], "idle_default": True,
+    },
+    "opencode": {
+        "needs_input": ["Permission required", "Access external directory"],
+        "busy": ["Thinking…"] + _SPIN,
+        "idle": ["Permission required", "> "], "idle_default": True,
+    },
+    "codex": {
+        "needs_input": ["Would you like to run the following command?"],
+        "busy": ["Working", "esc to interrupt"] + _SPIN,
+        "idle": ["⏎ send", "send"],
+    },
+    "bash": {"idle_last_line": True},
+    "": {
+        "busy": ["Thinking…", "Analyzing…", "esc to interrupt", "esc to cancel"] + _SPIN,
+        "busy_re": [CLAUDE_BUSY_RE], "idle": ["❯", "> "],
+        "idle_last_line": True, "idle_default": True,
+    },
+}
+
+
+def _manifest(provider: str) -> dict:
+    return PROVIDER_MANIFESTS.get((provider or "").lower().strip(), PROVIDER_MANIFESTS[""])
+
+
+def _has_busy(m: dict, text: str) -> bool:
+    return any(x in text for x in m.get("busy", ())) or any(
+        r.search(text) for r in m.get("busy_re", ()))
+
+
+def _has_idle_marker(m: dict, text: str) -> bool:
+    if any(x in text for x in m.get("idle", ())):
+        return True
+    if m.get("idle_last_line"):
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines and (BASH_PROMPT_RE.search(lines[-1])
+                      or lines[-1].endswith(("$", "#", "%", ">", "❯"))):
+            return True
+    return False
+
+
+def classify(text: str, provider: str = "") -> str:
+    """Classify rendered screen ``text`` into the nexus.code ``pty_state``
+    vocabulary: ``"none"`` (blank), ``"needs_input"`` (blocked dialog),
+    ``"working"``, or ``"idle"``. Precedence needs_input > working > idle; a
+    non-blank screen matching nothing degrades to ``"idle"``, never to
+    ``"needs_input"``. Unknown providers use the generic ``""`` manifest."""
+    if not text or not text.strip():
+        return "none"
+    m = _manifest(provider)
+    if any(x in text for x in m.get("needs_input", ())):
+        return "needs_input"
+    if _has_busy(m, text):
+        return "working"
+    return "idle"
+
+
+def is_busy(text: str, provider: str = "") -> bool:
+    """True when the screen shows the agent or process actively working.
+
+    Busy markers win even over a needs_input dialog (a spinner next to a trust
+    prompt is still busy) — unlike :func:`classify`, which reports needs_input."""
+    return bool(text) and _has_busy(_manifest(provider), text)
 
 
 def is_idle(text: str, provider: str = "") -> bool:
-    """Check if screen output indicates the agent or process is waiting for input."""
-    if not text or not text.strip():
+    """True when the screen shows the agent waiting for input and not busy."""
+    if not text or not text.strip() or is_busy(text, provider):
         return False
-    if is_busy(text, provider):
-        return False
-
-    prov = provider.lower().strip()
-    if prov == "claude":
-        return "❯" in text or "> " in text
-    elif prov == "agy":
-        return "accept-edits" in text or "❯" in text or "> " in text or not is_busy(text, prov)
-    elif prov == "gemini":
-        return "Type your message" in text or "YOLO" in text or "> " in text
-    elif prov == "copilot":
-        return "Do you want to" in text or "> " in text or not is_busy(text, prov)
-    elif prov == "opencode":
-        return "Permission required" in text or "> " in text or not is_busy(text, prov)
-    elif prov == "bash":
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            return False
-        last = lines[-1]
-        return bool(BASH_PROMPT_RE.search(last)) or last.endswith(("$", "#", "%", ">", "❯"))
-    else:
-        # General stability fallback
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if lines:
-            last = lines[-1]
-            if bool(BASH_PROMPT_RE.search(last)) or "❯" in text or "> " in text:
-                return True
-        return not is_busy(text, "")
+    m = _manifest(provider)
+    return _has_idle_marker(m, text) or bool(m.get("idle_default"))
 
 
 def wait(
@@ -821,7 +873,7 @@ def list_sessions() -> list[dict]:
         alive = _probe_connect(sp)
         if not alive:
             # Check if PID is alive
-            pid = _find_dtach_pid(sp)
+            pid = find_dtach_master_pid(sp)
             if pid is None:
                 # Cleanup stale socket and lock
                 try:
@@ -842,7 +894,7 @@ def list_sessions() -> list[dict]:
 def kill(name: str) -> bool:
     """Terminate a dtach session and clean up socket artifacts."""
     sp = sock_path(name)
-    pid = _find_dtach_pid(sp)
+    pid = find_dtach_master_pid(sp)
     if pid is not None:
         try:
             os.kill(pid, 15)  # SIGTERM
@@ -857,4 +909,5 @@ def kill(name: str) -> bool:
                 os.unlink(path)
             except OSError:
                 pass
+    mark_session(name, False)  # lite#8: killed -> not live on the bus registry
     return True

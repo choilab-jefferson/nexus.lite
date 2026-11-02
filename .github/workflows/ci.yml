@@ -42,3 +42,9 @@ jobs:
       - name: Run loom adapter + multi-agent example tests (no loom binary, no API keys)
         run: |
           pytest -v tests/test_loom*.py
+
+      - name: Install released loom (explicit, sha256-verified) and run contract test
+        run: |
+          export LOOM_BIN="$(python -c 'from nexus_lite import loom; print(loom.install_loom(dest="/tmp/loom"))')"
+          "$LOOM_BIN" capabilities --json
+          pytest -v -rs tests/test_loom_contract.py

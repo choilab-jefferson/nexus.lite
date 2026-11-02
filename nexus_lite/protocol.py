@@ -22,6 +22,18 @@ def sanitize_pointer_token(val: str) -> str:
     return _WS_RE.sub("_", cleaned) or "-"
 
 
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def validate_bus_field(name: str, val: object) -> str:
+    """Typing guard + control-char/path-separator rejection for bus ids/targets/senders."""
+    if not isinstance(val, str):
+        raise TypeError(f"{name} must be str, got {type(val).__name__}")
+    if not val or _CTRL_RE.search(val) or "/" in val or "\\" in val or val in (".", ".."):
+        raise ValueError(f"invalid {name}: empty, control char or path separator")
+    return val
+
+
 def truncate_words(text: str, limit: int) -> str:
     """Truncate `text` to `limit` chars at a word boundary if possible, appending '…'."""
     text = text or ""

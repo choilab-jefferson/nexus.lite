@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+from pathlib import Path
 import re
 import stat
 import subprocess
@@ -8,7 +9,7 @@ import sys
 
 import pytest
 
-from nexus_lite import loom_multi_agent as m
+from nexus_lite.demos import loom_multi_agent as m
 
 # Fake `loom` binary: behaviour per provider from cfg.json beside it, so every failure
 # mode is injected deterministically. No network, no real loom, no API keys.
@@ -100,7 +101,7 @@ def test_pick_providers_falls_back_to_mock():
 
 
 def test_notebook_has_no_outputs():
-    nb = json.load(open("notebooks/loom_multi_agent_colab.ipynb"))
+    nb = json.loads(Path("notebooks/loom_multi_agent_colab.ipynb").read_text())
     assert all(not c.get("outputs") and c.get("execution_count") is None
                for c in nb["cells"] if c["cell_type"] == "code")
 
@@ -218,7 +219,7 @@ def test_fake_key_in_stderr_never_reaches_logs_json_or_sandbox(fakeloom, monkeyp
     for root, _d, names in os.walk(tmp_path):
         if "fake" in root.split(os.sep):
             continue  # the fake loom's own env/call dumps are test scaffolding
-        blobs += [open(os.path.join(root, n), errors="ignore").read() for n in names]
+        blobs += [Path(os.path.join(root, n)).read_text(errors="ignore") for n in names]
     for b in blobs:
         assert "FAKEKEYabcdef" not in b and "tok123456789" not in b
     assert "[REDACTED]" in log.read_text()
@@ -345,7 +346,7 @@ def test_hidden_tests_not_in_sandbox_or_prompts(tmp_path, monkeypatch):
     assert not any(n.startswith("test_h_") for n in os.listdir(res["sandbox"]))
     assert not os.path.abspath(res["hidden_dir"]).startswith(os.path.abspath(res["sandbox"]))
     for root, _d, names in os.walk(res["sandbox"]):
-        assert not any(marker in open(os.path.join(root, n), errors="ignore").read() for n in names)
+        assert not any(marker in Path(os.path.join(root, n)).read_text(errors="ignore") for n in names)
     rework = [p for p in prompts if "Acceptance tests (hidden" in p]
     assert rework
     for p in rework:   # feedback block = only `test_name: FailureKind` lines
@@ -397,7 +398,7 @@ def test_main_never_leaks_key_but_child_env_has_it(fakeloom, monkeypatch, capsys
     assert not any(c["argv_has_key"] for c in calls)           # ... but never argv
     for root, _d, names in os.walk(tmp_path / "sb"):
         for n in names:
-            assert "sk-secret-123" not in open(os.path.join(root, n), errors="ignore").read()
+            assert "sk-secret-123" not in Path(os.path.join(root, n)).read_text(errors="ignore")
 
 
 # ------------------------------------------------------------------ ensure_loom checksum
@@ -565,9 +566,9 @@ def test_docs_state_the_real_rework_limit():
     if os.path.exists(os.path.join(root, "docs/RELEASE.md")):   # docs/ is not in the public snapshot
         rels.append("docs/RELEASE.md")
     for rel in rels:
-        txt = open(os.path.join(root, rel), encoding="utf-8").read()
+        txt = Path(os.path.join(root, rel)).read_text(encoding="utf-8")
         assert "max 3 rework" not in txt and "up to 3 rework" not in txt, rel
-    assert "at most 2 rework rounds" in open(os.path.join(root, "notebooks/loom_multi_agent_colab.ipynb")).read()
+    assert "at most 2 rework rounds" in Path(os.path.join(root, "notebooks/loom_multi_agent_colab.ipynb")).read_text()
 
 
 def test_baseline_without_files_is_no_file_and_continues_for_missing_files(tmp_path, monkeypatch):
@@ -632,7 +633,7 @@ def test_default_tag_is_v0_2_1_and_used_in_urls(monkeypatch, tmp_path):
     urls = _fake_release(monkeypatch, blob, sums)
     dest = str(tmp_path / "loom")
     assert m.LOOM_TAG == "v0.2.1"
-    assert m.ensure_loom(dest) == dest and open(dest, "rb").read() == blob
+    assert m.ensure_loom(dest) == dest and Path(dest).read_bytes() == blob
     assert urls == [f"{m.LOOM_REL}/v0.2.1/{m.ASSET}", f"{m.LOOM_REL}/v0.2.1/checksums.txt"]
 
 

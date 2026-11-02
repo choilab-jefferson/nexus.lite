@@ -44,7 +44,8 @@ import textwrap
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from . import core, pty
+from .. import core, pty
+from ..memory import ltm as mem_ltm
 
 
 def _py_cmd(script: Union[str, Path]) -> str:
@@ -199,7 +200,7 @@ def _run_llm_swarm(
             out_text = (r.get("output") or "").strip()
             if slug and out_text and r.get("rc", 0) == 0:
                 try:
-                    existing = core.wiki_read(slug)
+                    existing = mem_ltm.wiki_read(slug)
                 except Exception:
                     existing = ""
                 updated = (
@@ -207,7 +208,7 @@ def _run_llm_swarm(
                     f"## Live Agent Analysis (`{r.get('agent_cmd')}` — `{s['task_id']}`)\n"
                     f"{out_text}\n"
                 )
-                core.wiki_write(slug, updated)
+                mem_ltm.wiki_write(slug, updated)
         return used_agent, swarm_res
 
     candidates = _build_fallback_candidates(resolved)
@@ -249,7 +250,7 @@ def _run_llm_swarm(
         out_text = (r.get("output") or "").strip()
         if slug and out_text and r.get("rc", 0) == 0:
             try:
-                existing = core.wiki_read(slug)
+                existing = mem_ltm.wiki_read(slug)
             except Exception:
                 existing = ""
             updated = (
@@ -257,7 +258,7 @@ def _run_llm_swarm(
                 f"## Live Agent Analysis (`{used_agent}` — `{s['task_id']}`)\n"
                 f"{out_text}\n"
             )
-            core.wiki_write(slug, updated)
+            mem_ltm.wiki_write(slug, updated)
 
     return used_agent, swarm_res
 
@@ -304,7 +305,7 @@ def _run_llm_pipeline(
         stage_list = pipe_res.get("stages", [])
         if wiki_slug and stage_list:
             try:
-                existing = core.wiki_read(wiki_slug)
+                existing = mem_ltm.wiki_read(wiki_slug)
             except Exception:
                 existing = ""
             lines = [existing.rstrip(), "", f"## Live Multi-Tier Role Pipeline (`{used_agent}`)"]
@@ -313,7 +314,7 @@ def _run_llm_pipeline(
                 st_out = (st.get("output") or "").strip()
                 st_cmd = st.get("agent_cmd") or roster[idx_st % len(roster)]
                 lines.append(f"### Stage `{st_name}` (`{st_cmd}`)\n{st_out}")
-            core.wiki_write(wiki_slug, "\n\n".join(lines) + "\n")
+            mem_ltm.wiki_write(wiki_slug, "\n\n".join(lines) + "\n")
         return used_agent, pipe_res
 
     candidates = _build_fallback_candidates(resolved)
@@ -359,7 +360,7 @@ def _run_llm_pipeline(
     stage_list = pipe_res.get("stages", [])
     if wiki_slug and stage_list:
         try:
-            existing = core.wiki_read(wiki_slug)
+            existing = mem_ltm.wiki_read(wiki_slug)
         except Exception:
             existing = ""
         lines = [existing.rstrip(), "", f"## Live Multi-Agent Role Pipeline (`{used_agent}`)"]
@@ -367,7 +368,7 @@ def _run_llm_pipeline(
             st_name = st.get("stage", "stage")
             st_out = (st.get("output") or "").strip()
             lines.append(f"### Stage `{st_name}`\n{st_out}")
-        core.wiki_write(wiki_slug, "\n\n".join(lines) + "\n")
+        mem_ltm.wiki_write(wiki_slug, "\n\n".join(lines) + "\n")
 
     return used_agent, pipe_res
 
@@ -1755,7 +1756,7 @@ def run_opencode_free_demo(
         wiki_lines.append("")
 
     wiki_slug = "opencode/zero_signup_multi_agent_demo"
-    wiki_path = core.wiki_write(wiki_slug, "\n".join(wiki_lines))
+    wiki_path = mem_ltm.wiki_write(wiki_slug, "\n".join(wiki_lines))
 
     return {
         "work_dir": str(wdir),
@@ -1795,7 +1796,7 @@ def run_all_demos(
         "demo2_hipaa_privacy_pipeline": demo2,
         "demo3_multimodal_imaging_swarm": demo3,
         "demo4_lung1_audit_pipeline": demo4,
-        "wiki_articles": core.wiki_list(),
+        "wiki_articles": mem_ltm.wiki_list(),
         "dashboard_path": dashboard_path,
     }
 

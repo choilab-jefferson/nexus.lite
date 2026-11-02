@@ -1,24 +1,24 @@
 ---
 name: nexus-colab
-description: Connect local agents (Agy, Claude, Nexus) to a remote Google Colab or headless GPU runtime via cloudflared bridge and execute GPU workloads, control dtach PTYs, run multi-agent swarms and pipelines, and monitor live dashboards.
+description: Connect local agents (Agy, Claude, Nexus) to a remote Google Colab or headless GPU runtime via cloudflared tunnel and execute GPU workloads, control dtach PTYs, run multi-agent swarms and pipelines, and monitor live dashboards.
 ---
 
-# Nexus-Colab Remote Bridge Skill
+# Nexus-Colab Remote Tunnel Skill
 
 The `nexus-colab` skill enables local agents (Agy, Claude Code, Nexus) or developers to connect securely to a remote Google Colab instance, remote GPU server, or containerized runtime with **zero infrastructure setup, zero port forwarding, and zero open firewall ports**.
 
 ### Google Colab Execution Environment Highlights
 - **Pre-installed `agy` CLI**: Google Colab environments pre-install Antigravity CLI (`agy`) since 2026-09-16 alongside official `google-colab-cli` and `colab-mcp`, providing ready-to-use multi-agent CLI capability on PATH without manual setup.
-- **Default Google Drive Mount & Non-Destructive Credentials**: `nl.ensure_colab()` automatically defaults persistent storage to `/content/drive/MyDrive/nexus-lite` when running in Colab and safely links `/root/.gemini` credentials to Drive without overwriting existing files.
-- **Persistent Cloudflared Tunnel & Standalone Live Dashboard**: `nl.start_bridge(tunnel=True)` exposes an ephemeral `trycloudflare.com` tunnel and auto-detects Colab proxy ports. Standalone dashboards support auto-refresh via `&refresh=3`.
+- **Default Google Drive Mount & Non-Destructive Credentials**: `colab.ensure_colab()` automatically defaults persistent storage to `/content/drive/MyDrive/nexus-lite` when running in Colab and safely links `/root/.gemini` credentials to Drive without overwriting existing files.
+- **Persistent Cloudflared Tunnel & Standalone Live Dashboard**: `tunnel.start_tunnel(tunnel=True)` exposes an ephemeral `trycloudflare.com` tunnel and auto-detects Colab proxy ports. Standalone dashboards support auto-refresh via `&refresh=3`.
 
 Under the hood:
-1. The remote Colab runtime starts `nexus_lite.start_bridge()`, running an HTTP JSON Bridge Server over an ephemeral `trycloudflare.com` tunnel via `cloudflared`.
-2. The local agent uses `nexus_lite.RemoteColab(url, token)` or the `nexus-lite bridge` CLI to execute GPU workloads, spawn and drive persistent `dtach` PTY sessions, orchestrate multi-agent swarms and pipelines, and inspect live HTML5 dashboards.
+1. The remote Colab runtime starts `nexus_lite.colab.tunnel.start_tunnel()`, running an HTTP JSON Tunnel Server over an ephemeral `trycloudflare.com` tunnel via `cloudflared`.
+2. The local agent uses `nexus_lite.colab.tunnel.ColabTunnelClient(url, token)` or the `nexus-lite-colab` CLI to execute GPU workloads, spawn and drive persistent `dtach` PTY sessions, orchestrate multi-agent swarms and pipelines, and inspect live HTML5 dashboards.
 
 ---
 
-## 1. Initializing Environment and Starting Bridge in Google Colab
+## 1. Initializing Environment and Starting Tunnel in Google Colab
 
 Run in a Google Colab notebook cell:
 
@@ -29,48 +29,52 @@ Run in a Google Colab notebook cell:
 from google.colab import drive
 drive.mount("/content/drive")
 
+import secrets
 import nexus_lite as nl
+from nexus_lite import colab
+from nexus_lite import demos
+from nexus_lite.colab import tunnel
 
 # 1. Initialize Colab environment:
-# Automatically mounts /content/drive/MyDrive/nexus-lite, non-destructively syncs ~/.gemini credentials,
-# and starts the bridge server and cloudflared tunnel if not already running.
-env = nl.ensure_colab()
+# Automatically mounts /content/drive/MyDrive/nexus-lite and non-destructively syncs ~/.gemini credentials.
+env = colab.ensure_colab()
 print("Workspace initialized at:", env["workspace"])
 
-# 2. Inspect bridge connection info
-bridge_info = env.get("bridge") or nl.start_bridge(port=8765, tunnel=True)
+# 2. Inspect tunnel connection info
+token = secrets.token_hex(16)
+tunnel_info = tunnel.start_tunnel(port=8765, tunnel=True, token=token)
 
-print("Remote Bridge Public URL:", bridge_info["public_url"])
-print("Live HTML5 Dashboard (Cloudflare):", bridge_info["dashboard_url"])
-if bridge_info.get("colab_dashboard_url"):
-    print("Live HTML5 Dashboard (Colab Proxy):", bridge_info["colab_dashboard_url"])
-print("Auth Token:", bridge_info["token"])
+print("Remote Tunnel Public URL:", tunnel_info["public_url"])
+print("Live HTML5 Dashboard (Cloudflare):", tunnel_info["dashboard_url"])
+if tunnel_info.get("colab_dashboard_url"):
+    print("Live HTML5 Dashboard (Colab Proxy):", tunnel_info["colab_dashboard_url"])
+print("Auth Token:", tunnel_info["token"])
 ```
 
 Output:
 ```text
 Workspace initialized at: /content/drive/MyDrive/nexus-lite
-Remote Bridge Public URL: https://random-subdomain.trycloudflare.com
+Remote Tunnel Public URL: https://random-subdomain.trycloudflare.com
 Live HTML5 Dashboard (Cloudflare): https://random-subdomain.trycloudflare.com/dashboard?token=a8f...
 Live HTML5 Dashboard (Colab Proxy): https://...-colab.googleusercontent.com/dashboard?token=a8f...
 Auth Token: a8f73b8902c384...
 ```
 
 > [!WARNING]
-> **Do NOT call `nl.stop_bridge()` automatically at the end of runs or notebooks.**
-> The bridge server and cloudflared tunnel run in persistent `dtach` background sessions to maintain connectivity for external agents, monitoring tools, and live dashboards. Calling `stop_bridge()` immediately terminates the tunnel, resulting in 502 Bad Gateway / Cloudflare Error 1033. To stop manually, invoke `nl.stop_bridge()`.
+> **Do NOT call `tunnel.stop_tunnel()` automatically at the end of runs or notebooks.**
+> The tunnel server and cloudflared tunnel run in persistent `dtach` background sessions to maintain connectivity for external agents, monitoring tools, and live dashboards. Calling `stop_tunnel()` immediately terminates the tunnel, resulting in 502 Bad Gateway / Cloudflare Error 1033. To stop manually, invoke `tunnel.stop_tunnel()`.
 
 ---
 
 ## 2. Connecting from Local Agents (Python Client)
 
-Any local agent or script connects using `nexus_lite.RemoteColab`:
+Any local agent or script connects using `nexus_lite.colab.tunnel.ColabTunnelClient`:
 
 ```python
-from nexus_lite import RemoteColab
+from nexus_lite.colab.tunnel import ColabTunnelClient
 
 # Connect to Colab runtime
-remote = RemoteColab(
+remote = ColabTunnelClient(
     url="https://random-subdomain.trycloudflare.com",
     token="a8f73b8902c384...",
 )
@@ -187,6 +191,7 @@ print("Final Pytest Exit Code:", coop_res["final_pytest_rc"], "Verdict:", coop_r
 ## 5. Remote Message Bus, Short-Term Memory (`stm/1`) & Wiki
 
 ### Native `stm/1` Short-Term Memory (`<nexus_stm>`)
+STM = live working state. (MTM = flow carried across interruptions, transported by the bus below; LTM = the wiki, the authoritative durable record; MTM+ is retired.) `agent=` below is a free-form role label, not a registered identity.
 ```python
 # Record an stm/1 decision node on the remote workspace
 node = remote.stm_write(
@@ -202,6 +207,7 @@ print("Packed STM nodes:", len(envelope["nodes"]))
 ```
 
 ### Agent Bus (Inter-agent communication and PTY pointer line injection)
+`bus_send` is the lite verb for nexus say/dm/relay; target `ALL` broadcasts to live sessions. A "session" is a dtach PTY, never a delegated worker; completion of a delegated worker arrives as `TASK_COMPLETE` / `TASK_ESCALATE` messages to its caller.
 ```python
 # Send message to an active PTY session on Colab
 remote.bus_send(
@@ -243,19 +249,19 @@ View the real-time visualization dashboard from anywhere:
 
 ## 7. CLI Usage
 
-You can also interact with the remote bridge from the terminal:
+You can also interact with the remote tunnel from the terminal:
 
 ```bash
 # Execute remote command
-nexus-lite bridge exec "nvidia-smi" \
+nexus-lite-colab exec "nvidia-smi" \
   --url "https://random-subdomain.trycloudflare.com" \
   --token "a8f73b8902c384..."
 
-# Inspect bridge status on host
-nexus-lite bridge status
+# Inspect tunnel status on host
+nexus-lite-colab status
 
 # Run built-in QRadiomics + MedImage multi-agent workflows
-nexus-lite demo all
+nexus-lite-demo demo all
 ```
 
 ---
@@ -264,7 +270,7 @@ nexus-lite demo all
 
 `nexus-lite` includes four domain-grounded medical imaging & radiomics multi-agent workflows powered by `choilab-jefferson/qradiomics` (`v0.9.5`) and `choilab-jefferson/medimage`:
 
-1. **`nl.run_phantom_shape_swarm()`**: 3-worker parallel swarm computing Choi 2021 *CMPB* `spic6` (`Np`, `Na`, `Nl`, `Na_att`, `s1`, `s2`) and Choi 2014 *CMPB* 180-D `AHSN` + `wall_eliminate` across 5 3D lung nodule phantoms.
-2. **`nl.run_hipaa_privacy_pipeline()`**: 3-stage role pipeline (`driver` -> `verifier` -> `refiner`) planting synthetic PHI in DICOM slices, running `qr anonymize --replace-pid --pid-salt`, auditing `0` residual PHI findings, and verifying 100% HU pixel/geometry parity (`medimage` Ch.5).
-3. **`nl.run_multimodal_imaging_swarm()`**: 3-worker parallel swarm across CT L3 body composition (`medimage` Ch.6), CHAOS T1-DUAL MRI Dixon liver steatosis vs. spleen noise floor (`medimage` Ch.7), and ACRIN 6668 FDG-PET/CT QIBA SUV calibration & longitudinal $\Delta\text{SUV}$ (`medimage` Ch.8).
-4. **`nl.run_lung1_audit_pipeline()`**: 3-stage role pipeline (`driver` -> `navigator` -> `verifier`) reproducing the `OS_months`/`OS_event` target-leakage bug (`AUC = 1.000` vs. leak-free CV) and auditing multiple comparisons (`Bonferroni`) and sample-size scaling on NSCLC-Radiomics Lung1 (`medimage` Ch.12 & Ch.13).
+1. **`demos.run_phantom_shape_swarm()`**: 3-worker parallel swarm computing Choi 2021 *CMPB* `spic6` (`Np`, `Na`, `Nl`, `Na_att`, `s1`, `s2`) and Choi 2014 *CMPB* 180-D `AHSN` + `wall_eliminate` across 5 3D lung nodule phantoms.
+2. **`demos.run_hipaa_privacy_pipeline()`**: 3-stage role pipeline (`driver` -> `verifier` -> `refiner`) planting synthetic PHI in DICOM slices, running `qr anonymize --replace-pid --pid-salt`, auditing `0` residual PHI findings, and verifying 100% HU pixel/geometry parity (`medimage` Ch.5).
+3. **`demos.run_multimodal_imaging_swarm()`**: 3-worker parallel swarm across CT L3 body composition (`medimage` Ch.6), CHAOS T1-DUAL MRI Dixon liver steatosis vs. spleen noise floor (`medimage` Ch.7), and ACRIN 6668 FDG-PET/CT QIBA SUV calibration & longitudinal $\Delta\text{SUV}$ (`medimage` Ch.8).
+4. **`demos.run_lung1_audit_pipeline()`**: 3-stage role pipeline (`driver` -> `navigator` -> `verifier`) reproducing the `OS_months`/`OS_event` target-leakage bug (`AUC = 1.000` vs. leak-free CV) and auditing multiple comparisons (`Bonferroni`) and sample-size scaling on NSCLC-Radiomics Lung1 (`medimage` Ch.12 & Ch.13).

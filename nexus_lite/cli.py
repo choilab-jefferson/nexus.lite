@@ -8,6 +8,10 @@ Subcommands:
 - delegate
 - wiki (write/read/search/list)
 - chat
+- stm / compute
+
+Demo and orchestration scenarios (demo, multi-tier, interact, cooperate, dashboard) live in
+`nexus-lite-demo` (nexus_lite.demos.cli); the kernel CLI does not import them.
 """
 
 from __future__ import annotations
@@ -16,9 +20,13 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
-from . import bridge, core, demos, pty, viz
+from . import compute, core, pty
+from .memory import ltm as mem_ltm
+from .memory import mtm as mem_mtm
+from .memory import stm as mem_stm
 
 
 EXIT_OK, EXIT_FAILED, EXIT_ESCALATED, EXIT_TIMEOUT, EXIT_CONFIG = 0, 1, 3, 124, 78
@@ -26,7 +34,7 @@ _STATUS_EXIT = {"timeout": EXIT_TIMEOUT, "failed": EXIT_FAILED, "escalated": EXI
 
 
 EXIT_CODES_HELP = (
-    "exit codes (delegate, multi-tier, interact): "
+    "exit codes (delegate): "
     "0 ok, 1 failed, 3 escalated, 124 timeout, 78 config error"
 )
 
@@ -87,28 +95,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_pty_kill.add_argument("name", help="Session name")
 
     # bus
-    p_bus = sub.add_parser("bus", help="Message bus commands")
+    p_bus = sub.add_parser("bus", help="Message bus commands (MTM: flow carried across interruptions; transport = bus)")
     bus_sub = p_bus.add_subparsers(dest="bus_subcommand", help="Bus operations")
 
-    p_bus_send = bus_sub.add_parser("send", help="Send a message to an agent/session")
-    p_bus_send.add_argument("target", help="Target agent or session name (or ALL)")
+    p_bus_send = bus_sub.add_parser("send", help="Send a message (lite verb 'bus send' = nexus say/dm/relay) to an agent name or a live PTY session")
+    p_bus_send.add_argument("target", help="Target agent name or PTY session name, or ALL (broadcast to live sessions)")
     p_bus_send.add_argument("message", help="Message body")
     p_bus_send.add_argument("--sender", default="user", help="Sender identifier")
-    p_bus_send.add_argument("--kind", default="dm", help="Message kind (dm, broadcast, task)")
+    p_bus_send.add_argument("--kind", default="dm", help="Message kind (dm, broadcast, task); stored as-is in the pointer line")
 
     p_bus_read = bus_sub.add_parser("read", help="Read messages from the bus")
     p_bus_read.add_argument("--target", default=None, help="Filter by target name")
     p_bus_read.add_argument("--limit", type=int, default=20, help="Max messages to return")
+    p_bus_read.add_argument("--since-seq", type=int, default=None, help="Only messages with seq > N")
+    p_bus_read.add_argument("--unacked", action="store_true", help="Only unacked for --target")
+
+    p_bus_ack = bus_sub.add_parser("ack", help="Ack messages up to seq for a target")
+    p_bus_ack.add_argument("target")
+    p_bus_ack.add_argument("seq", type=int)
+
+    p_bus_reg = bus_sub.add_parser("register", help="Mark a session live (redelivers unacked)")
+    p_bus_reg.add_argument("name")
+    p_bus_unreg = bus_sub.add_parser("unregister", help="Mark a session not live")
+    p_bus_unreg.add_argument("name")
+
+    p_bus_prune = bus_sub.add_parser("prune", help="Delete old acked messages")
+    p_bus_prune.add_argument("--max-age-s", type=float, required=True)
+    p_bus_prune.add_argument("--keep-last", type=int, default=0)
 
     # delegate
     p_del = sub.add_parser(
         "delegate",
-        help="Delegate a task to a worker agent",
+        help="Delegate a task to a worker (a leaf agent process, not a PTY session)",
         description="Delegate a task. Exit codes: 0 ok, 1 failed, 3 escalated, 124 timeout, 78 config error.",
     )
     p_del.add_argument("cmd", help="Worker command line")
     p_del.add_argument("prompt", help="Task prompt or instruction")
-    p_del.add_argument("--caller", default="main", help="Caller session ID (default: main)")
+    p_del.add_argument("--caller", default="main", help="Caller name that receives the TASK_COMPLETE / TASK_ESCALATE completion message (default: main)")
     p_del.add_argument("--task-id", default=None, help="Explicit task ID")
     p_del.add_argument("--bg", action="store_true", help="Run task in background")
     p_del.add_argument("--timeout", type=float, default=120.0, help="Timeout in seconds")
@@ -139,115 +162,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--provider", default="", help="Agent provider")
     p_chat.add_argument("--timeout", type=float, default=60.0, help="Timeout in seconds")
 
-    # dashboard
-    p_dash = sub.add_parser("dashboard", help="Render HTML5 multi-agent visualization dashboard")
-    p_dash.add_argument("--out", "-o", default=None, help="Output HTML file path (default: .nexus/dashboard.html)")
-
-    # bridge
-    p_bridge = sub.add_parser("bridge", help="Cloudflared remote Colab bridge server and client")
-    bridge_sub = p_bridge.add_subparsers(dest="bridge_subcommand", help="Bridge operations")
-
-    p_br_start = bridge_sub.add_parser("start", help="Start HTTP bridge server (loopback; tunnel only with --tunnel --token)")
-    p_br_start.add_argument("--port", "-p", type=int, default=8765, help="Port to listen on (default: 8765)")
-    p_br_start.add_argument("--tunnel", action="store_true", help="Publish a public trycloudflare tunnel (requires --token)")
-    p_br_start.add_argument("--token", "-t", default=None, help="Bearer token (random if omitted; required with --tunnel)")
-    p_br_start.add_argument("--show-token", action="store_true", help="Print the bearer token to stdout")
-
-    bridge_sub.add_parser("stop", help="Stop running bridge server and tunnel")
-    bridge_sub.add_parser("status", help="Show bridge server and tunnel status")
-
-    p_br_exec = bridge_sub.add_parser("exec", help="Execute remote command on bridge server")
-    p_br_exec.add_argument("cmd", help="Shell command to execute remotely")
-    p_br_exec.add_argument("--url", "-u", required=True, help="Remote bridge URL")
-    p_br_exec.add_argument("--token", "-t", required=True, help="Authentication Bearer token")
-
-    # demo
-    p_demo = sub.add_parser("demo", help="Run practical qradiomics + medimage multi-agent demos")
-    p_demo.add_argument(
-        "workflow",
-        nargs="?",
-        default="all",
-        choices=[
-            "all",
-            "phantoms", "phantom-swarm",
-            "privacy", "hipaa-pipeline",
-            "multimodal", "multimodal-swarm",
-            "lung1", "lung1-audit",
-            "opencode", "opencode-free",
-        ],
-        help="Demo workflow to run (default: all)",
-    )
-    p_demo.add_argument(
-        "--agent",
-        "-a",
-        default="auto",
-        help="Agent CLI to orchestrate in swarms and role pipelines (auto, agy, opencode, claude, multi-tier, python)",
-    )
-    p_demo.add_argument("--work-dir", default=None, help="Custom work directory for demo artifacts")
-
-    # multi-tier
-    p_mt = sub.add_parser(
-        "multi-tier",
-        help="Run 3-Tier Swarm Orchestration (Tier-0 Scout -> Tier-1 OpenCode Swarm -> Tier-2 AGY Verifier)",
-    )
-    p_mt.add_argument("goal", help="High-level engineering or research goal")
-    p_mt.add_argument("--workspace", "-w", default=None, help="Target workspace directory")
-    p_mt.add_argument("--tier0-provider", default="opencode", help="Tier-0 scout provider (default: opencode)")
-    p_mt.add_argument("--tier0-model", default="opencode/big-pickle", help="Tier-0 scout model (default: opencode/big-pickle)")
-    p_mt.add_argument(
-        "--tier1-agent",
-        action="append",
-        default=None,
-        help="Tier-1 parallel swarm agent (repeatable, default: opencode/mimo-v2.6-flash-free + opencode/glm-5.3-flash-free)",
-    )
-    p_mt.add_argument("--tier2-agent", default="agy", help="Tier-2 verifier/synthesizer agent (default: agy)")
-    p_mt.add_argument("--phi", action="store_true", help="Enforce PHI local-only confinement (Tier-0 only)")
-    p_mt.add_argument("--stm", action="store_true", help="Opt in to <nexus_stm> short-term memory injection")
-    p_mt.add_argument("--wiki-slug", default="multi_tier/latest_report", help="Wiki slug to store final report")
-    p_mt.add_argument("--timeout", type=float, default=90.0, help="Per-tier timeout in seconds")
-
-    # interact
-    p_mt.epilog = EXIT_CODES_HELP
-    p_int = sub.add_parser(
-        "interact",
-        help="Run a 5-turn Agent-to-Agent (A2A) interaction loop across AGY <-> OpenCode over [nexus] dm",
-    )
-    p_int.add_argument("goal", help="Engineering goal for collaborative implementation & peer review")
-    p_int.add_argument("--target-file", default="solution.py", help="Target workspace file to write/revise")
-    p_int.add_argument("--workspace", "-w", default=None, help="Target workspace directory")
-    p_int.add_argument("--architect-agent", default="agy", help="Architect/Verifier agent (default: agy)")
-    p_int.add_argument("--reviewer-agent", default="opencode/big-pickle", help="Peer reviewer agent (default: opencode/big-pickle)")
-    p_int.add_argument("--coder-provider", default="opencode", help="Coder provider (default: opencode)")
-    p_int.add_argument("--coder-model", default="", help="Coder model identifier")
-    p_int.add_argument("--wiki-slug", default="interaction/latest_a2a", help="Wiki slug to store A2A transcript")
-    p_int.add_argument("--timeout", type=float, default=90.0, help="Per-turn timeout in seconds")
-
-    # cooperate
-    p_coop = sub.add_parser(
-        "cooperate",
-        help="Run a 5-phase Multi-Agent Cooperative Problem-Solving Workflow (Architect -> Swarm -> Peer Verifier -> Refiner -> Consensus)",
-    )
-    p_coop.add_argument(
-        "goal",
-        nargs="?",
-        default=(
-            "Design, implement, adversarially test, and verify a leakage-safe "
-            "Clinical Radiomics Cohort Stratification & HIPAA Pseudonymization Engine"
-        ),
-        help="Complex multi-constraint problem goal",
-    )
-    p_coop.add_argument("--workspace", "-w", default=None, help="Target workspace directory")
-    p_coop.add_argument("--module-name", "-m", default=None, help="Target Python module name (auto-inferred if omitted)")
-    p_coop.add_argument("--max-rounds", type=int, default=3, help="Max closed-loop repair iterations (default: 3)")
-    p_coop.add_argument("--architect-agent", default="agy", help="Architect/Sign-off agent (default: agy, or python)")
-    p_coop.add_argument("--verifier-agent", default="opencode/mimo-v2.6-flash-free", help="Test engineer & peer verifier agent")
-    p_coop.add_argument("--coder-provider", default="opencode", help="Coder provider (default: opencode)")
-    p_coop.add_argument("--coder-model", default="", help="Coder model identifier")
-    p_coop.add_argument("--wiki-slug", default="coop/latest_solution", help="Wiki slug for final report")
-    p_coop.add_argument("--timeout", type=float, default=90.0, help="Per-phase timeout in seconds")
-
     # stm
-    p_stm = sub.add_parser("stm", help="Manage file-backed stm/1 short-term memory nodes and <nexus_stm> briefs")
+    p_stm = sub.add_parser("stm", help="Manage file-backed stm/1 nodes (STM: live working state) and <nexus_stm> briefs")
     stm_sub = p_stm.add_subparsers(dest="stm_subcommand", help="STM operations")
 
     p_stm_pack = stm_sub.add_parser("pack", help="Pack workspace stm/1 brief (<nexus_stm> or JSON)")
@@ -263,6 +179,45 @@ def build_parser() -> argparse.ArgumentParser:
     p_stm_search.add_argument("query", help="Search query")
     p_stm_search.add_argument("--workspace", "-w", default=None, help="Target workspace directory")
     p_stm_search.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+
+    # loom (explicit released-binary install)
+    p_loom = sub.add_parser("loom", help="loom agent harness helpers")
+    loom_sub = p_loom.add_subparsers(dest="loom_subcommand", help="loom operations")
+    p_loom_inst = loom_sub.add_parser("install", help="Download the pinned loom release binary, verify sha256, install")
+    p_loom_inst.add_argument("--version", default=None, help="loom version (default: pinned LOOM_VERSION)")
+    p_loom_inst.add_argument("--dest", default=None, help="Install path (default: ~/.local/bin/loom)")
+
+    # compute (zero-preinstall ship-lite-and-compute for Turing & Colab)
+    p_comp = sub.add_parser(
+        "compute",
+        help="Ship nexus-lite and execute computations on Turing HPC (internal) or Google Colab (external) without pre-installation",
+    )
+    p_comp.add_argument(
+        "target",
+        choices=["turing", "hpc", "colab", "local"],
+        help="Compute target: 'turing'/'hpc' (internal SLURM HPC), 'colab' (external Colab runtime), or 'local' (isolated sandbox)",
+    )
+    p_comp.add_argument("--python", "-c", default=None, help="Inline Python code to run (has `nexus_lite`/`nl`, `WORKSPACE`, `JOB_DIR`, `RESULT`)")
+    p_comp.add_argument("--script", "-s", default=None, help="Path to local Python script file to ship and execute")
+    p_comp.add_argument("--cmd", default=None, help="Shell command to execute remotely with PYTHONPATH pre-configured for nexus_lite")
+    p_comp.add_argument("--lite", default=None, help="nexus-lite CLI arguments string (e.g. 'tasks')")
+    p_comp.add_argument("--file", action="append", default=None, help="Extra file to stage into remote job dir (format: local_path or remote_name=local_path)")
+    p_comp.add_argument("--collect", action="append", default=None, help="Remote relative file path to collect back in result JSON")
+    p_comp.add_argument("--mode", default="srun", choices=["srun", "ssh", "sbatch"], help="HPC execution mode (default: srun)")
+    p_comp.add_argument("--partition", "-p", default="batch", help="SLURM partition name (default: batch)")
+    p_comp.add_argument("--gres", default=None, help="SLURM GRES specification (e.g. gpu:1 or gpu:l40s:1)")
+    p_comp.add_argument("--cpus", type=int, default=2, help="SLURM CPUs per task (default: 2)")
+    p_comp.add_argument("--mem", default=None, help="SLURM memory limit (e.g. 16G)")
+    p_comp.add_argument("--time", dest="time_limit", default="00:10:00", help="SLURM time limit (default: 00:10:00)")
+    p_comp.add_argument("--host", default=None, help="Override HPC SSH host (default: $NEXUS_TURING_HOST / $NEXUS_HPC_HOST / 'turing')")
+    p_comp.add_argument("--status", dest="status_job_id", default=None, help="Check status/result of an sbatch job ID")
+    p_comp.add_argument("--slurm-id", default=None, help="Optional SLURM numeric job ID when checking --status")
+    p_comp.add_argument("--url", default=None, help="Colab tunnel URL (default: $NEXUS_COLAB_URL or .nexus/tunnel.json)")
+    p_comp.add_argument("--token", default=None, help="Colab tunnel bearer token")
+    p_comp.add_argument("--ssh", dest="colab_ssh", default=None, help="Colab SSH host (default: $NEXUS_COLAB_SSH)")
+    p_comp.add_argument("--bootstrap-out", default=None, help="Write a standalone self-extracting Colab .py bundle to this path")
+    p_comp.add_argument("--start-tunnel", action="store_true", help="Start nexus_lite.colab.tunnel inside the remote Colab runtime")
+    p_comp.add_argument("--timeout", type=float, default=300.0, help="Execution timeout in seconds (default: 300)")
 
     return parser
 
@@ -331,17 +286,36 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 0
 
             if args.bus_subcommand == "send":
-                res = core.bus_send(args.target, args.message, sender=args.sender, kind=args.kind)
+                res = mem_mtm.bus_send(args.target, args.message, sender=args.sender, kind=args.kind)
                 print(f"Sent message {res['id']} to {res['target']}")
                 return 0
 
             elif args.bus_subcommand == "read":
-                msgs = core.bus_read(target=args.target, limit=args.limit)
+                msgs = mem_mtm.bus_read(
+                    target=args.target, limit=args.limit, since_seq=args.since_seq, unacked=args.unacked
+                )
                 if not msgs:
                     print("No messages.")
                 else:
                     for m in msgs:
                         print(f"[{m['kind']}] {m['id']} {m['sender']} -> {m['target']}: {m['summary']}")
+                return 0
+
+            elif args.bus_subcommand == "ack":
+                print(f"acked {args.target} <= {mem_mtm.bus_ack(args.target, args.seq)}")
+                return 0
+
+            elif args.bus_subcommand == "register":
+                res = mem_mtm.bus_register(args.name)
+                print(f"registered {args.name}; redelivered {len(res['redelivered'])}")
+                return 0
+
+            elif args.bus_subcommand == "unregister":
+                print(f"unregistered {args.name}" if mem_mtm.bus_unregister(args.name) else f"{args.name} not registered")
+                return 0
+
+            elif args.bus_subcommand == "prune":
+                print(f"pruned {mem_mtm.bus_prune(args.max_age_s, args.keep_last)}")
                 return 0
 
         elif args.subcommand == "delegate":
@@ -369,16 +343,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 content = args.content
                 if content == "-":
                     content = sys.stdin.read()
-                p = core.wiki_write(args.slug, content)
+                p = mem_ltm.wiki_write(args.slug, content)
                 print(f"Written wiki: {p}")
                 return 0
 
             elif args.wiki_subcommand == "read":
-                print(core.wiki_read(args.slug))
+                print(mem_ltm.wiki_read(args.slug))
                 return 0
 
             elif args.wiki_subcommand == "search":
-                results = core.wiki_search(args.query)
+                results = mem_ltm.wiki_search(args.query)
                 if not results:
                     print("No matches found.")
                 else:
@@ -387,7 +361,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 0
 
             elif args.wiki_subcommand == "list":
-                docs = core.wiki_list()
+                docs = mem_ltm.wiki_list()
                 if not docs:
                     print("No wiki pages.")
                 else:
@@ -400,128 +374,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             sys.stdout.write(output + "\n" if output else "")
             return 0
 
-        elif args.subcommand == "dashboard":
-            out_target = args.out if args.out else str(core.get_workspace() / "dashboard.html")
-            viz.dashboard(out_path=args.out, display_inline=False)
-            print(f"Dashboard rendered to {out_target}")
-            return 0
-
-        elif args.subcommand == "bridge":
-            if not args.bridge_subcommand:
-                parser.parse_args(["bridge", "--help"])
-                return 0
-
-            if args.bridge_subcommand == "start":
-                info = bridge.start_bridge(port=args.port, token=args.token, tunnel=args.tunnel)
-                print(f"Bridge started on port {info['port']}")
-                print(f"Local URL: {info['local_url']}")
-                if info.get("public_url"):
-                    print(f"Public URL: {info['public_url']}")
-                print(f"Dashboard URL: {info['dashboard_url']}")
-                if args.show_token:
-                    print(f"Token: {info['token']}")
-                else:
-                    print(f"Token file: {bridge.token_file_path(info['port'])} (0600)")
-                try:
-                    while True:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    bridge.stop_bridge()
-                    print("Bridge stopped.")
-                return 0
-
-            elif args.bridge_subcommand == "stop":
-                bridge.stop_bridge()
-                print("Bridge stopped.")
-                return 0
-
-            elif args.bridge_subcommand == "status":
-                info = bridge.get_bridge_info()
-                if not info:
-                    print("Bridge is not running.")
-                else:
-                    print(json.dumps(info, indent=2))
-                return 0
-
-            elif args.bridge_subcommand == "exec":
-                client = bridge.RemoteColab(args.url, args.token)
-                res = client.exec(cmd=args.cmd)
-                if res.get("stdout"):
-                    sys.stdout.write(res["stdout"])
-                if res.get("stderr"):
-                    sys.stderr.write(res["stderr"])
-                return res.get("rc", 0)
-
-        elif args.subcommand == "multi-tier":
-            res = core.run_multi_tier_swarm(
-                args.goal,
-                workspace=args.workspace,
-                tier0_provider=args.tier0_provider,
-                tier0_model=args.tier0_model,
-                tier1_agents=args.tier1_agent,
-                tier2_agent=args.tier2_agent,
-                phi=args.phi,
-                stm=args.stm,
-                wiki_slug=args.wiki_slug,
-                timeout=args.timeout,
-            )
-            print(json.dumps(res, indent=2, ensure_ascii=False))
-            if res.get("tier2_result"):
-                return status_exit_code(res["tier2_result"])
-            return status_exit_code(*res.get("tier0_results", []))
-
-        elif args.subcommand == "interact":
-            res = core.run_agent_interaction(
-                args.goal,
-                target_file=args.target_file,
-                workspace=args.workspace,
-                architect_agent=args.architect_agent,
-                reviewer_agent=args.reviewer_agent,
-                coder_provider=args.coder_provider,
-                coder_model=args.coder_model,
-                wiki_slug=args.wiki_slug,
-                timeout=args.timeout,
-            )
-            print(json.dumps(res, indent=2, ensure_ascii=False))
-            return status_exit_code(*(t.get("result") for t in res.get("turns", [])[-1:]))
-
-        elif args.subcommand == "cooperate":
-            res = core.run_cooperative_problem_solver(
-                args.goal,
-                module_name=args.module_name,
-                max_rounds=args.max_rounds,
-                workspace=args.workspace,
-                architect_agent=args.architect_agent,
-                verifier_agent=args.verifier_agent,
-                coder_provider=args.coder_provider,
-                coder_model=args.coder_model,
-                wiki_slug=args.wiki_slug,
-                timeout=args.timeout,
-                verbose=False,
-            )
-            print(json.dumps({
-                "goal": res["goal"],
-                "project_id": res["project_id"],
-                "module_path": res["module_path"],
-                "test_path": res["test_path"],
-                "draft_pytest_rc": res["draft_pytest_rc"],
-                "final_pytest_rc": res["final_pytest_rc"],
-                "repair_rounds": [
-                    {"round": r["round"], "agent": r["agent"], "pytest_rc": r["pytest_rc"]}
-                    for r in res.get("repair_rounds", [])
-                ],
-                "consensus_verdict": res["consensus_verdict"],
-                "wiki_path": res["wiki_path"],
-                "dashboard_path": res["dashboard_path"],
-            }, indent=2, ensure_ascii=False))
-            return 0 if res.get("final_pytest_rc", 1) == 0 else 1
-
         elif args.subcommand == "stm":
             if not args.stm_subcommand:
                 parser.parse_args(["stm", "--help"])
                 return 0
             if args.stm_subcommand == "pack":
-                out = core.stm_pack(
+                out = mem_stm.stm_pack(
                     workspace=args.workspace,
                     phi=args.phi,
                     as_json=args.json,
@@ -532,58 +390,95 @@ def main(argv: Optional[list[str]] = None) -> int:
                     print(out)
                 return 0
             elif args.stm_subcommand == "list":
-                nodes = core.stm_list(kind=args.kind, workspace=args.workspace)
+                nodes = mem_stm.stm_list(kind=args.kind, workspace=args.workspace)
                 print(json.dumps(nodes, indent=2, ensure_ascii=False))
                 return 0
             elif args.stm_subcommand == "search":
-                hits = core.stm_search(args.query, limit=args.limit, workspace=args.workspace)
+                hits = mem_stm.stm_search(args.query, limit=args.limit, workspace=args.workspace)
                 print(json.dumps(hits, indent=2, ensure_ascii=False))
                 return 0
 
-        elif args.subcommand == "demo":
-            wf = args.workflow
-            ag = args.agent
-            if wf in ("phantoms", "phantom-swarm"):
-                res = demos.run_phantom_shape_swarm(work_dir=args.work_dir, agent=ag)
-                print(json.dumps({
-                    "agent_used": res["agent_used"],
-                    "spic6": res["spic6"],
-                    "ahsn": res["ahsn"],
-                    "agent_outputs": res.get("agent_outputs", []),
-                }, indent=2, ensure_ascii=False))
-            elif wf in ("privacy", "hipaa-pipeline"):
-                res = demos.run_hipaa_privacy_pipeline(work_dir=args.work_dir, agent=ag)
-                print(json.dumps(res["audit"], indent=2, ensure_ascii=False))
-            elif wf in ("multimodal", "multimodal-swarm"):
-                res = demos.run_multimodal_imaging_swarm(work_dir=args.work_dir, agent=ag)
-                print(json.dumps({
-                    "agent_used": res["agent_used"],
-                    "ct": res["ct_bodycomp"],
-                    "mri": res["mri_steatosis"],
-                    "pet": res["pet_suv"],
-                    "agent_outputs": res.get("agent_outputs", []),
-                }, indent=2, ensure_ascii=False))
-            elif wf in ("lung1", "lung1-audit"):
-                res = demos.run_lung1_audit_pipeline(work_dir=args.work_dir, agent=ag)
-                print(json.dumps(res["review"], indent=2, ensure_ascii=False))
-            elif wf in ("opencode", "opencode-free"):
-                res = demos.run_opencode_free_demo(work_dir=args.work_dir)
-                print(json.dumps({
-                    "agent_used": res["agent_used"],
-                    "models": res["models"],
-                    "swarm": [
-                        {"task_id": r["task_id"], "cmd": r["agent_cmd"], "status": r["status"], "output": r["output"].strip()}
-                        for r in res["swarm"]
-                    ],
-                    "pipeline_final": res["pipeline"].get("final_output", "").strip(),
-                    "wiki_slug": res["wiki_slug"],
-                }, indent=2, ensure_ascii=False))
-            else:
-                res = demos.run_all_demos(work_dir=args.work_dir, agent=ag, render_dashboard=True)
-                print(f"Completed all 4 qradiomics + medimage multi-agent demos (agent={res.get('agent_used')}).")
-                print(f"Wiki articles indexed: {len(res['wiki_articles'])}")
-                print(f"Dashboard: {res['dashboard_path']}")
+        elif args.subcommand == "loom":
+            if args.loom_subcommand != "install":
+                parser.parse_args(["loom", "--help"])
+                return 0
+            from . import loom as _loom
+            try:
+                path = _loom.install_loom(args.version or _loom.LOOM_VERSION, dest=args.dest)
+            except Exception as e:
+                print(f"loom install failed: {e}", file=sys.stderr)
+                return EXIT_FAILED
+            print(path)
             return 0
+
+        elif args.subcommand == "compute":
+            import shlex as _shlex
+
+            if args.target in ("turing", "hpc") and args.status_job_id:
+                res = compute.turing_job_status(
+                    args.status_job_id,
+                    slurm_job_id=args.slurm_id,
+                    ssh_host=args.host,
+                    timeout=args.timeout,
+                )
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                return 0 if res.get("ok", True) else EXIT_FAILED
+
+            py_code = args.python
+            if args.script:
+                py_code = Path(args.script).expanduser().read_text(encoding="utf-8")
+            lite_argv = _shlex.split(args.lite) if args.lite else None
+
+            extra_files: dict[str, str] = {}
+            for item in args.file or []:
+                if "=" in item:
+                    rname, lpath = item.split("=", 1)
+                else:
+                    lpath = item
+                    rname = Path(item).name
+                extra_files[rname] = Path(lpath).expanduser().read_text(encoding="utf-8")
+
+            if args.target in ("turing", "hpc"):
+                res = compute.run_on_turing(
+                    python=py_code,
+                    cmd=args.cmd,
+                    lite_argv=lite_argv,
+                    files=extra_files or None,
+                    collect_files=args.collect,
+                    mode=args.mode,
+                    partition=args.partition,
+                    gres=args.gres,
+                    cpus=args.cpus,
+                    mem=args.mem,
+                    time_limit=args.time_limit,
+                    ssh_host=args.host,
+                    timeout=args.timeout,
+                )
+            elif args.target == "colab":
+                res = compute.run_on_colab(
+                    python=py_code,
+                    cmd=args.cmd,
+                    lite_argv=lite_argv,
+                    files=extra_files or None,
+                    collect_files=args.collect,
+                    url=args.url,
+                    token=args.token,
+                    ssh_host=args.colab_ssh,
+                    bootstrap_out=args.bootstrap_out,
+                    start_tunnel=args.start_tunnel,
+                    timeout=args.timeout,
+                )
+            else:
+                res = compute.run_local_sandbox(
+                    python=py_code,
+                    cmd=args.cmd,
+                    lite_argv=lite_argv,
+                    files=extra_files or None,
+                    collect_files=args.collect,
+                    timeout=args.timeout,
+                )
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+            return 0 if res.get("ok", False) else EXIT_FAILED
 
     except Exception as e:
         sys.stderr.write(f"Error: {e}\n")

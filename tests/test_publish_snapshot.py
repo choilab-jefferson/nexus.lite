@@ -16,13 +16,14 @@ ps = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ps)
 
 # Leak-triggering literals are assembled at runtime so this file itself is leak-clean.
-HOST = "ser49" + "88-a.tjh." + "tju.edu"
+HOST = "ser49" + "88-a.tjh." + "tju." + "edu"
 WT = ".work" + "trees"
 HOME = "/ho" + "me/wxc" + "151/x\n"
 
 CFG = {"allowlist": ["nexus_lite/", "notebooks/", "README.md", ".gitignore"],
        "public_author_name": "Pub", "public_author_email": "pub@example.com",
-       "license": "MIT", "strip_notebook_outputs": "if-flagged"}
+       "license": "MIT", "strip_notebook_outputs": "if-flagged",
+       "dist_name": "nexus-lite", "source_name": "nexus.lite", "version_source": "none"}
 
 
 def _nb(out_text):
@@ -149,3 +150,61 @@ def test_release_leak_hit_rc1(tmp_path):
     rc, out = _rel(tmp_path, extra={"nexus_lite/b.py": "u='" + HOST + "'\n", "LICENSE": "MIT\n"},
                    cfg={"allowlist": CFG["allowlist"] + ["LICENSE"]})
     assert rc == 1 and not (out / "nexus-lite-v1.2.3.bundle").exists()
+
+
+# ---- repo-agnostic behaviour (fake non-lite config) ----
+FAKE = {"allowlist": ["pkg/", "pyproject.toml", "LICENSE"],
+        "public_author_name": "Pub Lisher", "public_author_email": "pub@example.org",
+        "license": "MIT", "dist_name": "fakeproj", "source_name": "fake.src",
+        "bundle_name": "fakebundle", "tag_prefix": "rel-", "version_source": "pyproject",
+        "extra_leak_patterns": [["fake-secret", "FAKE_SECRET_[A-Z]+"]],
+        "github_url": "git@example.com:o/fake.git"}
+FAKE_FILES = {"pkg/a.py": "x = 1\n", "LICENSE": "MIT\n",
+              "pyproject.toml": '[build-system]\nrequires=[]\n[project]\nname="fakeproj"\nversion = "3.4.5"\n'}
+
+
+def test_fake_config_dry_run_ok(tmp_path, capsys):
+    r = _repo(tmp_path, FAKE_FILES)
+    rc = ps.release("rel-3.4.5", "HEAD", tmp_path / "o", FAKE, dry_run=True, repo=str(r))
+    o = capsys.readouterr().out
+    assert rc == 0 and "leak-check: OK" in o and "fakebundle-rel-3.4.5.bundle" in o
+    assert '--author="Pub Lisher <pub@example.org>"' in o
+    assert "nexus-lite" not in o
+
+
+def test_fake_config_extra_pattern_and_tag_prefix(tmp_path):
+    r = _repo(tmp_path, dict(FAKE_FILES, **{"pkg/b.py": "k='FAKE_SECRET_ABC'\n"}))
+    assert ps.release("rel-3.4.5", "HEAD", tmp_path / "o", FAKE, dry_run=True, repo=str(r)) == 1
+    assert ps.release("v3.4.5", "HEAD", tmp_path / "o2", FAKE, dry_run=True, repo=str(r)) == 2
+
+
+def test_version_mismatch_refuses_real_release(tmp_path, capsys):
+    r = _repo(tmp_path, FAKE_FILES)
+    rc = ps.release("rel-9.9.9", "HEAD", tmp_path / "o", FAKE, repo=str(r))
+    assert rc == 2 and "pyproject version" in capsys.readouterr().err
+
+
+def test_identity_check_rejects_foreign_commit(tmp_path):
+    d = tmp_path / "t"; d.mkdir()
+    (d / "f").write_text("ok\n")
+    g = lambda *a: subprocess.run(["git", "-C", str(d), *a], check=True, capture_output=True)
+    g("init", "-q"); g("add", "-A")
+    g("-c", "user.name=Nexus Bot", "-c", "user.email=bot@users.noreply.example", "commit", "-qm", "c")
+    hits = ps.leak_check(d, FAKE)
+    assert any(h.endswith(":author-identity") for h in hits)
+    assert any(h.endswith(":committer-identity") for h in hits)
+    assert ps.leak_check(d) == []   # no config -> no identity check
+
+
+def test_snapshot_forces_identity_over_local_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Someone"); monkeypatch.setenv("GIT_COMMITTER_EMAIL", "x@y.z")
+    r = _repo(tmp_path, FAKE_FILES)
+    d = tmp_path / "out"
+    full = ps.export("HEAD", d, FAKE, repo=str(r))
+    ps.snapshot(d, "rel-3.4.5", full, FAKE)
+    assert ps.leak_check(d, FAKE) == []
+
+
+def test_script_info(capsys):
+    assert ps.main(["script-info"]) == 0
+    assert "SCRIPT_VERSION=" in capsys.readouterr().out

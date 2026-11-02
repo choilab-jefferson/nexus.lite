@@ -1,5 +1,5 @@
 """
-nexus_lite.bridge — Cloudflared remote Colab bridge server and RemoteColab client.
+nexus_lite.colab.tunnel — Cloudflared remote Colab tunnel server and ColabTunnelClient.
 
 Allows any local agent (Claude, Agy, Nexus) or external browser to connect to
 a remote Google Colab or headless Linux runtime through an ephemeral
@@ -8,6 +8,7 @@ trycloudflare.com tunnel without firewall, port forwarding, or domain setup.
 
 from __future__ import annotations
 
+import argparse
 import hmac
 import http.server
 import json
@@ -28,7 +29,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from . import core, pty, viz
+from .. import core, pty
+from ..memory import ltm as mem_ltm
+from ..memory import mtm as mem_mtm
+from ..memory import stm as mem_stm
 
 _SERVER: Optional[http.server.ThreadingHTTPServer] = None
 _SERVER_THREAD: Optional[threading.Thread] = None
@@ -36,19 +40,19 @@ _SERVER_THREAD: Optional[threading.Thread] = None
 MAX_BODY_BYTES = 1024 * 1024
 DEFAULT_EXEC_TIMEOUT = 60.0
 MAX_EXEC_TIMEOUT = 600.0
-BRIDGE_SERVICE = "nexus-lite-bridge"
+TUNNEL_SERVICE = "nexus-lite-tunnel"
 
 
-def redact_bridge_info(info: Optional[dict]) -> Optional[dict]:
-    """Copy of bridge info without the secret token (safe to return, print or persist)."""
+def redact_tunnel_info(info: Optional[dict]) -> Optional[dict]:
+    """Copy of tunnel info without the secret token (safe to return, print or persist)."""
     if info is None:
         return None
     return {k: v for k, v in info.items() if k != "token"}
 
 
 def token_file_path(port: int) -> Path:
-    """Local-only (never Drive) 0600 file holding the bridge token for `port`."""
-    return Path(tempfile.gettempdir()) / f"nexus-lite-{os.getuid()}" / f"bridge-{port}.token"
+    """Local-only (never Drive) 0600 file holding the tunnel token for `port`."""
+    return Path(tempfile.gettempdir()) / f"nexus-lite-{os.getuid()}" / f"tunnel-{port}.token"
 
 
 def _write_token_file(port: int, token: str) -> Path:
@@ -155,9 +159,16 @@ def ensure_cloudflared() -> str:
         raise RuntimeError(f"Failed to download cloudflared: {e}") from e
 
 
-class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
+def _orchestration():
+    """Lazy import: demo orchestration lives outside the kernel."""
+    from ..demos import orchestration
+
+    return orchestration
+
+
+class TunnelRequestHandler(http.server.BaseHTTPRequestHandler):
     """
-    HTTP JSON API handler for nexus-lite remote bridge.
+    HTTP JSON API handler for nexus-lite remote tunnel.
     Protected by an `Authorization: Bearer <token>` header only (never the query string).
     """
 
@@ -188,9 +199,9 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if urllib.parse.urlparse(self.path).path == "/identity":
-            # Unauthenticated, secret-free liveness/identity probe used by stop_bridge/is_bridge_alive.
+            # Unauthenticated, secret-free liveness/identity probe used by stop_tunnel/is_tunnel_alive.
             self._send_json(200, {
-                "service": BRIDGE_SERVICE,
+                "service": TUNNEL_SERVICE,
                 "pid": os.getpid(),
                 "nonce": getattr(self.server, "nonce", ""),
             })
@@ -214,6 +225,8 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path in ("/dashboard", "/"):
+            from ..demos import viz  # lazy: demos are outside the kernel
+
             html_content = viz.render_dashboard_html()
             refresh_param = qs.get("refresh", [])
             if refresh_param:
@@ -281,9 +294,24 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                 ws_cwd = str(core.get_workspace())
 
                 if "python" in payload and payload["python"] is not None:
-                    res = _run_with_timeout(
-                        [sys.executable, "-c", payload["python"]], shell=False, cwd=ws_cwd, timeout=exec_timeout
-                    )
+                    py_src = str(payload["python"])
+                    if len(py_src.encode("utf-8")) > 65_536:
+                        with tempfile.NamedTemporaryFile("w", suffix=".py", encoding="utf-8", delete=False) as tf:
+                            tf.write(py_src)
+                            tmp_py = tf.name
+                        try:
+                            res = _run_with_timeout(
+                                [sys.executable, tmp_py], shell=False, cwd=ws_cwd, timeout=exec_timeout
+                            )
+                        finally:
+                            try:
+                                os.unlink(tmp_py)
+                            except OSError:
+                                pass
+                    else:
+                        res = _run_with_timeout(
+                            [sys.executable, "-c", py_src], shell=False, cwd=ws_cwd, timeout=exec_timeout
+                        )
                     self._send_json(504 if res.get("timed_out") else 200, res)
                     return
 
@@ -348,7 +376,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
             if path == "/bus":
                 action = payload.get("action")
                 if action == "send":
-                    msg = core.bus_send(
+                    msg = mem_mtm.bus_send(
                         target=payload["target"],
                         message=payload["message"],
                         sender=payload.get("sender", "user"),
@@ -358,7 +386,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 if action == "read":
-                    msgs = core.bus_read(
+                    msgs = mem_mtm.bus_read(
                         target=payload.get("target"),
                         limit=payload.get("limit", 20),
                     )
@@ -402,7 +430,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 if action == "multi_tier_swarm":
-                    res = core.run_multi_tier_swarm(
+                    res = _orchestration().run_multi_tier_swarm(
                         payload["goal"],
                         tier0_tasks=payload.get("tier0_tasks"),
                         tier1_tasks=payload.get("tier1_tasks"),
@@ -421,7 +449,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 if action == "interact":
-                    res = core.run_agent_interaction(
+                    res = _orchestration().run_agent_interaction(
                         goal=payload.get("goal", "Verify medical imaging coordinate transform and HU windowing"),
                         target_file=payload.get("target_file", "solution.py"),
                         architect_agent=payload.get("architect_agent", "agy"),
@@ -433,7 +461,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 if action == "cooperate":
-                    res = core.run_cooperative_problem_solver(
+                    res = _orchestration().run_cooperative_problem_solver(
                         goal=payload.get(
                             "goal",
                             "Build and adversarially verify a HIPAA-compliant Radiomics Cohort Integrity Engine",
@@ -455,7 +483,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
             if path == "/stm":
                 action = payload.get("action", "list")
                 if action == "write":
-                    node = core.stm_write(
+                    node = mem_stm.stm_write(
                         payload.get("node_id"),
                         kind=payload.get("kind", "task"),
                         status=payload.get("status", "running"),
@@ -469,7 +497,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 if action == "read":
-                    node = core.stm_read(payload["node_id"])
+                    node = mem_stm.stm_read(payload["node_id"])
                     if node is None:
                         self._send_json(404, {"error": f"STM node not found: {payload['node_id']}"})
                     else:
@@ -477,7 +505,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 if action == "list":
-                    nodes = core.stm_list(
+                    nodes = mem_stm.stm_list(
                         kind=payload.get("kind"),
                         include_invalid=bool(payload.get("include_invalid", False)),
                     )
@@ -485,7 +513,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 if action == "search":
-                    results = core.stm_search(
+                    results = mem_stm.stm_search(
                         payload["query"],
                         limit=int(payload.get("limit", 20)),
                     )
@@ -494,7 +522,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
 
                 if action == "pack":
                     as_json = bool(payload.get("as_json", True))
-                    packed = core.stm_pack(as_json=as_json)
+                    packed = mem_stm.stm_pack(as_json=as_json)
                     self._send_json(200, {"status": "ok", "pack": packed})
                     return
 
@@ -504,22 +532,22 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
             if path == "/wiki":
                 action = payload.get("action")
                 if action == "write":
-                    p = core.wiki_write(payload["slug"], payload["content"])
+                    p = mem_ltm.wiki_write(payload["slug"], payload["content"])
                     self._send_json(200, {"status": "ok", "path": str(p)})
                     return
 
                 if action == "read":
-                    content = core.wiki_read(payload["slug"])
+                    content = mem_ltm.wiki_read(payload["slug"])
                     self._send_json(200, {"status": "ok", "content": content})
                     return
 
                 if action == "search":
-                    results = core.wiki_search(payload["query"])
+                    results = mem_ltm.wiki_search(payload["query"])
                     self._send_json(200, {"status": "ok", "results": results})
                     return
 
                 if action == "list":
-                    articles = core.wiki_list()
+                    articles = mem_ltm.wiki_list()
                     self._send_json(200, {"status": "ok", "articles": articles})
                     return
 
@@ -536,7 +564,7 @@ class _ReusableThreadingHTTPServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-def start_bridge(
+def start_tunnel(
     port: int = 8765,
     token: Optional[str] = None,
     tunnel: bool = False,
@@ -545,7 +573,7 @@ def start_bridge(
     host: str = "127.0.0.1",
 ) -> dict:
     """
-    Start the remote HTTP JSON bridge server; a cloudflared tunnel only when explicitly requested.
+    Start the remote HTTP JSON tunnel server; a cloudflared tunnel only when explicitly requested.
 
     Parameters:
     - port: Port to listen on (0 for ephemeral OS-chosen port, default 8765).
@@ -559,12 +587,12 @@ def start_bridge(
 
     Returns local_url, public_url, dashboard_url, colab_proxy_url, colab_dashboard_url, token, port.
     URLs never embed the token (send it as `Authorization: Bearer`). The token is stored 0600 in a
-    local-only temp dir (see token_file_path), never in bridge.json.
+    local-only temp dir (see token_file_path), never in tunnel.json.
     """
     global _SERVER, _SERVER_THREAD
 
     if token is not None and not str(token).strip():
-        raise ValueError("bridge token must not be empty")
+        raise ValueError("tunnel token must not be empty")
     if tunnel and token is None:
         raise ValueError("starting a public tunnel requires an explicit non-empty token")
 
@@ -574,12 +602,12 @@ def start_bridge(
     token = str(token).strip()
 
     if _SERVER is not None:
-        stop_bridge()
+        stop_tunnel()
 
     try:
-        server = _ReusableThreadingHTTPServer((host, port), BridgeRequestHandler)
+        server = _ReusableThreadingHTTPServer((host, port), TunnelRequestHandler)
     except OSError:
-        server = _ReusableThreadingHTTPServer((host, 0), BridgeRequestHandler)
+        server = _ReusableThreadingHTTPServer((host, 0), TunnelRequestHandler)
     nonce = secrets.token_hex(8)
     server.token = token  # type: ignore[attr-defined]
     server.nonce = nonce  # type: ignore[attr-defined]
@@ -604,18 +632,18 @@ def start_bridge(
     if tunnel:
         try:
             try:
-                pty.kill("cloudflared-bridge")
+                pty.kill("cloudflared-tunnel")
             except Exception:
                 pass
             cf_bin = ensure_cloudflared()
             cmd = f"{cf_bin} tunnel --no-autoupdate --url {local_url}"
-            pty.spawn(cmd, name="cloudflared-bridge")
+            pty.spawn(cmd, name="cloudflared-tunnel")
 
             pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
             start_t = time.time()
             while time.time() - start_t < timeout:
                 time.sleep(0.5)
-                screen = pty.read("cloudflared-bridge")
+                screen = pty.read("cloudflared-tunnel")
                 match = pattern.search(screen)
                 if match:
                     public_url = match.group(0)
@@ -640,7 +668,7 @@ def start_bridge(
             colab_proxy_url = None
             colab_dashboard_url = None
 
-    bridge_info = {
+    tunnel_info = {
         "local_url": local_url,
         "public_url": public_url,
         "dashboard_url": dashboard_url,
@@ -653,8 +681,8 @@ def start_bridge(
     }
 
     try:
-        bridge_json_path = core.get_workspace() / "bridge.json"
-        bridge_json_path.write_text(json.dumps(bridge_info, indent=2), encoding="utf-8")
+        tunnel_json_path = core.get_workspace() / "tunnel.json"
+        tunnel_json_path.write_text(json.dumps(tunnel_info, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -670,7 +698,7 @@ def start_bridge(
 
 
 def _probe_identity(local_url: str, timeout: float = 1.5) -> Optional[dict]:
-    """GET /identity (unauthenticated, secret-free); None when nothing answers as a lite bridge."""
+    """GET /identity (unauthenticated, secret-free); None when nothing answers as a lite tunnel."""
     try:
         with urllib.request.urlopen(f"{local_url.rstrip('/')}/identity", timeout=timeout) as resp:
             if resp.status != 200:
@@ -678,13 +706,13 @@ def _probe_identity(local_url: str, timeout: float = 1.5) -> Optional[dict]:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
-    if isinstance(payload, dict) and payload.get("service") == BRIDGE_SERVICE:
+    if isinstance(payload, dict) and payload.get("service") == TUNNEL_SERVICE:
         return payload
     return None
 
 
-def _is_recorded_bridge(data: dict) -> bool:
-    """True only if the process in bridge.json answers /identity with the same pid and nonce."""
+def _is_recorded_tunnel(data: dict) -> bool:
+    """True only if the process in tunnel.json answers /identity with the same pid and nonce."""
     local_url = str(data.get("local_url") or "").strip()
     nonce = data.get("nonce")
     if not local_url or not nonce or not data.get("pid"):
@@ -693,10 +721,10 @@ def _is_recorded_bridge(data: dict) -> bool:
     return bool(ident and ident.get("nonce") == nonce and ident.get("pid") == data.get("pid"))
 
 
-def stop_bridge() -> None:
+def stop_tunnel() -> None:
     """
-    Shut down the HTTP bridge server, kill cloudflared-bridge dtach session,
-    and remove .nexus/bridge.json.
+    Shut down the HTTP tunnel server, kill cloudflared-tunnel dtach session,
+    and remove .nexus/tunnel.json.
     """
     global _SERVER, _SERVER_THREAD
 
@@ -710,20 +738,20 @@ def stop_bridge() -> None:
         _SERVER_THREAD = None
 
     try:
-        pty.kill("cloudflared-bridge")
+        pty.kill("cloudflared-tunnel")
     except Exception:
         pass
 
     try:
         ws = core.get_workspace()
-        bridge_json_path = ws / "bridge.json"
-        if bridge_json_path.exists():
+        tunnel_json_path = ws / "tunnel.json"
+        if tunnel_json_path.exists():
             try:
-                data = json.loads(bridge_json_path.read_text(encoding="utf-8"))
+                data = json.loads(tunnel_json_path.read_text(encoding="utf-8"))
                 pid = data.get("pid")
-                # Only signal a pid proven (via /identity nonce + pid) to be the recorded lite bridge;
-                # a stale bridge.json may name a recycled, unrelated pid.
-                if pid and pid != os.getpid() and _is_recorded_bridge(data):
+                # Only signal a pid proven (via /identity nonce + pid) to be the recorded lite tunnel;
+                # a stale tunnel.json may name a recycled, unrelated pid.
+                if pid and pid != os.getpid() and _is_recorded_tunnel(data):
                     try:
                         os.kill(pid, signal.SIGTERM)
                     except OSError:
@@ -731,31 +759,31 @@ def stop_bridge() -> None:
             except Exception:
                 pass
             try:
-                bridge_json_path.unlink()
+                tunnel_json_path.unlink()
             except OSError:
                 pass
     except Exception:
         pass
 
 
-def get_bridge_info() -> Optional[dict]:
-    """Return parsed dictionary from .nexus/bridge.json if bridge is running."""
+def get_tunnel_info() -> Optional[dict]:
+    """Return parsed dictionary from .nexus/tunnel.json if tunnel is running."""
     try:
-        bridge_json_path = core.get_workspace() / "bridge.json"
-        if not bridge_json_path.exists():
+        tunnel_json_path = core.get_workspace() / "tunnel.json"
+        if not tunnel_json_path.exists():
             return None
-        return redact_bridge_info(json.loads(bridge_json_path.read_text(encoding="utf-8")))
+        return redact_tunnel_info(json.loads(tunnel_json_path.read_text(encoding="utf-8")))
     except Exception:
         return None
 
 
-def is_bridge_alive(info: Optional[dict] = None, require_tunnel: bool = False) -> bool:
+def is_tunnel_alive(info: Optional[dict] = None, require_tunnel: bool = False) -> bool:
     """
-    Verify that the bridge server recorded in `info` (or `bridge.json`) is actively listening
-    in the current runtime via `/identity`, and optionally that `cloudflared-bridge` is running.
-    Prevents stale `bridge.json` files persisted on Google Drive from masking dead tunnels.
+    Verify that the tunnel server recorded in `info` (or `tunnel.json`) is actively listening
+    in the current runtime via `/identity`, and optionally that `cloudflared-tunnel` is running.
+    Prevents stale `tunnel.json` files persisted on Google Drive from masking dead tunnels.
     """
-    data = info if info is not None else get_bridge_info()
+    data = info if info is not None else get_tunnel_info()
     if not data or not isinstance(data, dict):
         return False
     local_url = str(data.get("local_url") or "").strip().rstrip("/")
@@ -765,7 +793,7 @@ def is_bridge_alive(info: Optional[dict] = None, require_tunnel: bool = False) -
         return False
     if data.get("public_url"):
         try:
-            sp = pty.sock_path("cloudflared-bridge")
+            sp = pty.sock_path("cloudflared-tunnel")
             if not os.path.exists(sp) or not pty._probe_connect(sp):
                 return False
         except Exception:
@@ -777,7 +805,7 @@ def is_bridge_alive(info: Optional[dict] = None, require_tunnel: bool = False) -
     return not nonce or ident.get("nonce") == nonce
 
 
-class RemoteColab:
+class ColabTunnelClient:
     """
     Standard library urllib.request client for interacting with a remote
     nexus-lite runtime running in Google Colab or remote Linux environment.
@@ -799,7 +827,12 @@ class RemoteColab:
             headers["Content-Type"] = "application/json"
 
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=180.0) as resp:
+        try:
+            resp = urllib.request.urlopen(req, timeout=180.0)
+        except urllib.error.HTTPError as e:
+            e.close()
+            raise
+        with resp:
             content_type = resp.headers.get("Content-Type", "")
             raw = resp.read()
             if "application/json" in content_type:
@@ -1131,6 +1164,82 @@ class RemoteColab:
         return res.get("articles", [])
 
     def dashboard_html(self) -> str:
-        """Fetch rendered HTML5 visualization dashboard from remote bridge."""
+        """Fetch rendered HTML5 visualization dashboard from remote tunnel."""
         res = self._request("GET", "/dashboard")
         return res if isinstance(res, str) else str(res)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entrypoint for nexus-lite-colab / python -m nexus_lite.colab.tunnel."""
+    parser = argparse.ArgumentParser(
+        prog="nexus-lite-colab",
+        description="nexus-lite Colab tunnel utility (remote HTTP JSON API & cloudflared tunnel)",
+    )
+    sub = parser.add_subparsers(dest="subcommand", help="Tunnel operations")
+
+    p_start = sub.add_parser("start", help="Start HTTP tunnel server (loopback; tunnel only with --tunnel --token)")
+    p_start.add_argument("--port", "-p", type=int, default=8765, help="Port to listen on (default: 8765)")
+    p_start.add_argument("--tunnel", action="store_true", help="Publish a public trycloudflare tunnel (requires --token)")
+    p_start.add_argument("--token", "-t", default=None, help="Bearer token (random if omitted; required with --tunnel)")
+    p_start.add_argument("--show-token", action="store_true", help="Print the bearer token to stdout")
+
+    sub.add_parser("stop", help="Stop running tunnel server and cloudflared session")
+    sub.add_parser("status", help="Show tunnel server status")
+
+    p_exec = sub.add_parser("exec", help="Execute remote command on tunnel server")
+    p_exec.add_argument("cmd", help="Shell command to execute remotely")
+    p_exec.add_argument("--url", "-u", required=True, help="Remote tunnel URL")
+    p_exec.add_argument("--token", "-t", required=True, help="Authentication Bearer token")
+
+    args = parser.parse_args(argv)
+
+    if not args.subcommand:
+        parser.print_help()
+        return 0
+
+    if args.subcommand == "start":
+        info = start_tunnel(port=args.port, token=args.token, tunnel=args.tunnel)
+        print(f"Tunnel started on port {info['port']}")
+        print(f"Local URL: {info['local_url']}")
+        if info.get("public_url"):
+            print(f"Public URL: {info['public_url']}")
+        print(f"Dashboard URL: {info['dashboard_url']}")
+        if args.show_token:
+            print(f"Token: {info['token']}")
+        else:
+            print(f"Token file: {token_file_path(info['port'])} (0600)")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            stop_tunnel()
+            print("Tunnel stopped.")
+        return 0
+
+    elif args.subcommand == "stop":
+        stop_tunnel()
+        print("Tunnel stopped.")
+        return 0
+
+    elif args.subcommand == "status":
+        info = get_tunnel_info()
+        if not info:
+            print("Tunnel is not running.")
+        else:
+            print(json.dumps(info, indent=2))
+        return 0
+
+    elif args.subcommand == "exec":
+        client = ColabTunnelClient(args.url, args.token)
+        res = client.exec(cmd=args.cmd)
+        if res.get("stdout"):
+            sys.stdout.write(res["stdout"])
+        if res.get("stderr"):
+            sys.stderr.write(res["stderr"])
+        return res.get("rc", 0)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

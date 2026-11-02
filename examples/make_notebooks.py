@@ -38,18 +38,18 @@ def build(title, gpu, env_note, models, env_vars, hetero, tiny=False):
         body = "".join(f"  {{'task_id': {t!r}, 'cmd': agent('You are a {r}. Be concise.', MODELS[{i % 2}]), 'prompt': f'List 3 {w} for {{topic}}.'}},\n" for i, (t, r, w) in enumerate(roles))
         cells += [
             md("## 4. Tiny-model swarm: 6 agents, 2 tiny models, one GPU (or CPU)\nAgents alternate between `" + models[0] + "` and `" + models[1] + "`; all 6 run concurrently."),
-            code("import nexus_lite as nl\nnl.ensure_colab()\ntopic = 'a REST API for a todo-list service'\nspecs = [\n" + body + "]\nt0 = time.time()\nresults = nl.run_swarm(specs, caller='orchestrator', timeout=900.0)\nprint(f'6-agent swarm finished in {time.time()-t0:.1f}s')\nfor r in results: print(f\"\\n[{r['status'].upper()}] {r['task_id']}\\n{r['output'].strip()}\")"),
+            code("import nexus_lite as nl\nfrom nexus_lite import colab\nfrom nexus_lite.demos import viz\ncolab.ensure_colab()\ntopic = 'a REST API for a todo-list service'\nspecs = [\n" + body + "]\nt0 = time.time()\nresults = nl.run_swarm(specs, caller='orchestrator', timeout=900.0)\nprint(f'6-agent swarm finished in {time.time()-t0:.1f}s')\nfor r in results: print(f\"\\n[{r['status'].upper()}] {r['task_id']}\\n{r['output'].strip()}\")"),
         ]
         cells += [
             md("## 5. Sequential pipeline: driver → verifier → documenter"),
             code("stages = [\n  {'name': 'driver',     'cmd': agent('You write short Python code.', MODELS[0]),        'prompt': 'Write a Python function slugify(text). Output only code.'},\n  {'name': 'verifier',   'cmd': agent('You review code for bugs. Be concise.', MODELS[1]), 'prompt': 'Review this code and list issues:\\n{prev_output}'},\n  {'name': 'documenter', 'cmd': agent('You write concise docs.', MODELS[0]),             'prompt': 'Write a 3-line docstring based on this review:\\n{prev_output}'},\n]\npipe = nl.run_pipeline(stages, initial_prompt='slugify', caller='orchestrator', timeout=900.0)\nfor s in pipe['stages']: print(f\"--- {s['stage']} (rc={s.get('rc')}) ---\\n{s.get('output','').strip()}\\n\")"),
             md("## 6. Inspect"),
-            code("!nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv || true\n!ollama ps\nnl.dashboard()"),
+            code("!nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv || true\n!ollama ps\nviz.dashboard()"),
         ]
         return {"cells": cells, "metadata": {"language_info": {"name": "python"}, "colab": {"provenance": [], "gpuType": "T4"}, "accelerator": "GPU", "kernelspec": {"name": "python3", "display_name": "Python 3"}}, "nbformat": 4, "nbformat_minor": 5}
     cells += [
         md("## 4. Parallel swarm: 3 local agents on one GPU" + (f"\nHeterogeneous: the security reviewer runs on `{m2}`, the others on `{main}` (both stay resident in VRAM)." if hetero else "\nOllama queues requests, so the workers share the GPU.")),
-        code("import nexus_lite as nl\nnl.ensure_colab()\ntopic = 'a REST API for a todo-list service'\n"
+        code("import nexus_lite as nl\nfrom nexus_lite import colab\nfrom nexus_lite.demos import viz\ncolab.ensure_colab()\ntopic = 'a REST API for a todo-list service'\n"
              "specs = [\n"
              f"  {{'task_id': 'arch',  'cmd': agent('You are a software architect. Be concise.', {sw_models[0]}), 'prompt': f'List 4 key design decisions for {{topic}}.'}},\n"
              f"  {{'task_id': 'sec',   'cmd': agent('You are a security reviewer. Be concise.', {sw_models[1]}),  'prompt': f'List 4 security risks for {{topic}}.'}},\n"
@@ -65,7 +65,7 @@ def build(title, gpu, env_note, models, env_vars, hetero, tiny=False):
              "]\npipe = nl.run_pipeline(stages, initial_prompt='slugify', caller='orchestrator', timeout=600.0)\n"
              "for s in pipe['stages']: print(f\"--- {s['stage']} (rc={s.get('rc')}) ---\\n{s.get('output','').strip()}\\n\")"),
         md("## 6. Inspect: GPU utilisation, loaded models, dashboard"),
-        code("!nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv\n!ollama ps\nnl.dashboard()"),
+        code("!nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv\n!ollama ps\nviz.dashboard()"),
     ]
     return {"cells": cells, "metadata": {"language_info": {"name": "python"}, "colab": {"provenance": [], "gpuType": gpu.split()[0]}, "accelerator": "GPU", "kernelspec": {"name": "python3", "display_name": "Python 3"}}, "nbformat": 4, "nbformat_minor": 5}
 
@@ -102,14 +102,56 @@ def loom_multi_agent_nb():
            "payloads (two flawed modules fixed in round 2). Mock numbers are scripted, not evidence about any model."),
         md("## 1. Install nexus-lite"),
         code("!pip install -q git+https://github.com/choilab-jefferson/nexus.lite.git pytest"),
-        md("## 2. Run (auto: real providers if secrets exist, else mock)\nThe sandbox directory is kept and its path printed. "
-           "The first real run downloads loom (checksum-verified release, falls back to a source build). Add `--json-out run.json` "
+        md("## 2. Install and probe the `loom` binary\n"
+           "Installing loom is an explicit step: `install_loom()` downloads the pinned release binary and verifies its sha256. "
+           "Then `nexus_lite.loom.probe()` verifies the CLI capabilities and exit-code contract."),
+        code("from nexus_lite import loom\n"
+             "import os\n"
+             "if not loom.find_loom():\n"
+             "    p = loom.install_loom()  # explicit download of the pinned release (sha256-verified)\n"
+             "    os.environ['LOOM_BIN'] = str(p)\n"
+             "print('MIN_LOOM_VERSION:', loom.MIN_LOOM_VERSION, 'DEFAULT_EXIT_CODES:', loom.DEFAULT_EXIT_CODES)\n"
+             "pr = loom.probe()\n"
+             "print('probe:', pr.available, pr.path or pr.error)"),
+        md("## 3. Core 4-module build (`basic`: tokenizer, intervals, ttlcache, money)\n"
+           "The sandbox directory is kept and its path printed. Add `--json-out run.json` "
            "to keep rounds, per-agent status/time/error, hidden pass counts and baseline numbers."),
-        code("from nexus_lite.loom_multi_agent import main\nmain([])"),
-        md("Force the offline path: `main(['--providers', 'mock'])`. Failure injection, e.g. a wrong key for one worker so retry/fallback "
+        code("from nexus_lite.demos.loom_multi_agent import main\nmain(['--json-out', '/tmp/loom_basic_run.json'])"),
+        md("## 4. IBSI Radiomics multi-agent suite (`radiomics-firstorder`, `radiomics-texture`, `radiomics-stats`)\n"
+           "Runs all three 4-module IBSI radiomics tasks (93 hidden acceptance tests total: intensity discretisation, "
+           "3D ROI masking, first-order statistics, histogram entropy/uniformity, 2D/3D GLCM & GLRLM textures, "
+           "Shrout-Fleiss ICC(3,1), Benjamini-Hochberg FDR, train-only Z-score standardisation, and Harrell's C-index)."),
+        code("from nexus_lite.demos.loom_multi_agent import main\n"
+             "from nexus_lite.demos.loom_radiomics_tasks import DEFAULT_TASKS\n"
+             "main(['--task', DEFAULT_TASKS, '--json-out', '/tmp/loom_radiomics_run.json'])"),
+        md("## 5. Failure injection, retry/fallback & secret redaction\n"
+           "Force the offline path: `main(['--providers', 'mock'])`. Failure injection, e.g. a wrong key for one worker so retry/fallback "
            "run: `main(['--providers', 'anthropic,gemini', '--inject-bad-key', 'worker-2'])`; a short timeout: "
            "`'--inject-timeout', 'reviewer=1'`. Repeat runs: `'--runs', '3'`. Baseline self-repair, reported separately: "
            "`'--baseline-repair', '3'`."),
+        code("from nexus_lite.demos.loom_multi_agent import redact\n"
+             "sample_err = '401 Unauthorized: sk-ant-api03-SECRETKEY1234567890 and AIza' + 'SyD-SECRETGEMINIKEY1234567890'\n"
+             "print('Redacted error sample:', redact(sample_err))"),
+        md("## 6. Zero-preinstall remote compute bundle (`nexus_lite.compute` × Colab tunnel)\n"
+           "Packs `nexus_lite` + the 3 IBSI radiomics `loom` multi-agent tasks into a single self-extracting script and "
+           "runs it over an ephemeral `nexus_lite.colab.tunnel` loopback server (or exports a standalone Colab bundle)."),
+        code("import nexus_lite as nl\n"
+             "from nexus_lite.colab import tunnel as colab_tunnel\n\n"
+             "info = colab_tunnel.start_tunnel(port=0, tunnel=False)\n"
+             "try:\n"
+             "    tok = colab_tunnel.token_file_path(info['port']).read_text().strip()\n"
+             "    res = nl.run_on_colab(\n"
+             "        python=\"\"\"\n"
+             "from nexus_lite.demos.loom_multi_agent import build, get_task\n"
+             "r = build(['mock'], '', {}, max_rounds=3, baseline=True, out=lambda *a, **k: None, backoff=0.0, task=get_task('radiomics-firstorder'))\n"
+             "RESULT = {'ok': r['ok'], 'passed': r['hidden']['passed'], 'total': r['hidden']['total']}\n"
+             "\"\"\",\n"
+             "        url=info['local_url'],\n"
+             "        token=tok,\n"
+             "    )\n"
+             "    print('Tunnel execution result:', res['result'])\n"
+             "finally:\n"
+             "    colab_tunnel.stop_tunnel()"),
     ]
     return {"cells": cells, "metadata": {"language_info": {"name": "python"}, "colab": {"provenance": []},
                                          "kernelspec": {"name": "python3", "display_name": "Python 3"}},

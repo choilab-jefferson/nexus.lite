@@ -9,7 +9,10 @@ from pathlib import Path
 import pytest
 
 import nexus_lite as nl
-from nexus_lite import cli, pty
+from nexus_lite import pty
+from nexus_lite.colab import env as colab_env
+from nexus_lite.demos import cli as demo_cli
+from nexus_lite.demos import scenarios
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +47,7 @@ def test_claude_and_agy_normalization():
 
 def test_demo1_phantom_shape_swarm(isolated_demo_env):
     """Verify 3-worker 3D lung nodule phantom swarm (spic6, AHSN, manifest)."""
-    res = nl.run_phantom_shape_swarm(agent="python")
+    res = scenarios.run_phantom_shape_swarm(agent="python")
     assert len(res["swarm_results"]) == 3
     for t in res["swarm_results"]:
         assert t["status"] == "completed"
@@ -64,7 +67,7 @@ def test_demo1_phantom_shape_swarm(isolated_demo_env):
 
 def test_demo2_hipaa_privacy_pipeline(isolated_demo_env):
     """Verify 3-stage role pipeline (driver -> verifier -> refiner) for DICOM PHI removal."""
-    res = nl.run_hipaa_privacy_pipeline(agent="python")
+    res = scenarios.run_hipaa_privacy_pipeline(agent="python")
     stages = res["pipeline_result"]["stages"]
     assert [s["stage"] for s in stages] == ["driver", "verifier", "refiner"]
     assert all(s["status"] == "completed" for s in stages)
@@ -82,7 +85,7 @@ def test_demo2_hipaa_privacy_pipeline(isolated_demo_env):
 
 def test_demo3_multimodal_imaging_swarm(isolated_demo_env):
     """Verify 3-worker multimodal swarm (CT L3 body composition, CHAOS MRI steatosis, PET SUV)."""
-    res = nl.run_multimodal_imaging_swarm(agent="python")
+    res = scenarios.run_multimodal_imaging_swarm(agent="python")
     assert len(res["swarm_results"]) == 3
     assert all(t["status"] == "completed" for t in res["swarm_results"])
 
@@ -102,7 +105,7 @@ def test_demo3_multimodal_imaging_swarm(isolated_demo_env):
 
 def test_demo4_lung1_audit_pipeline(isolated_demo_env):
     """Verify 3-stage Lung1 data-leakage and reproducibility audit pipeline."""
-    res = nl.run_lung1_audit_pipeline(agent="python", n_patients=60)
+    res = scenarios.run_lung1_audit_pipeline(agent="python", n_patients=60)
     stages = res["pipeline_result"]["stages"]
     assert [s["stage"] for s in stages] == ["driver", "navigator", "verifier"]
     assert all(s["status"] == "completed" for s in stages)
@@ -121,12 +124,12 @@ def test_demo4_lung1_audit_pipeline(isolated_demo_env):
 
 def test_cli_demo_subcommand(isolated_demo_env, capsys):
     """Verify `nexus-lite demo` CLI subcommands execute cleanly."""
-    rc = cli.main(["demo", "phantoms", "--agent", "python"])
+    rc = demo_cli.main(["demo", "phantoms", "--agent", "python"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "soft_lung_cancer_spiculated" in out
 
-    rc_all = cli.main(["demo", "all", "--agent", "python"])
+    rc_all = demo_cli.main(["demo", "all", "--agent", "python"])
     assert rc_all == 0
     out_all = capsys.readouterr().out
     assert "Completed all 4 qradiomics + medimage multi-agent demos" in out_all
@@ -139,7 +142,7 @@ def test_cli_demo_subcommand(isolated_demo_env, capsys):
 )
 def test_live_agy_or_claude_hipaa_demo_pipeline(isolated_demo_env):
     """Verify live `agy`/`claude` 3-stage role pipeline on the HIPAA DICOM de-identification demo."""
-    res = nl.run_hipaa_privacy_pipeline(agent="auto")
+    res = scenarios.run_hipaa_privacy_pipeline(agent="auto")
     assert res["audit"]["verdict"] == "PASS"
     assert any(a in res["agent_used"] for a in ("agy", "claude"))
     wiki_doc = nl.wiki_read("compliance/dicom_privacy_audit")
@@ -157,7 +160,7 @@ def test_gemini_drive_two_way_symlink_and_overwrite(tmp_path):
     (local_gemini / "oauth.json").write_text("UPDATED_LOCAL_TOKEN", encoding="utf-8")
 
     # 1. Explicit overwrite_local_changes=True updates Drive before symlinking
-    nl.sync_dotdir_to_drive(local_gemini, drive_gemini, overwrite_local_changes=True)
+    colab_env.sync_dotdir_to_drive(local_gemini, drive_gemini, overwrite_local_changes=True)
     assert local_gemini.is_symlink()
     assert (drive_gemini / "oauth.json").read_text(encoding="utf-8") == "UPDATED_LOCAL_TOKEN"
 
@@ -183,10 +186,9 @@ def test_fake_colab_environment_and_drive_mount_simulation(tmp_path, monkeypatch
     monkeypatch.delenv("NEXUS_LITE_DIR", raising=False)
     monkeypatch.delenv("NEXUS_LITE_HOME", raising=False)
 
-    env_info = nl.ensure_env(
+    env_info = colab_env.ensure_env(
         workspace=str(fake_drive_workspace),
         gemini_drive_path=str(fake_drive_gemini),
-        start_bridge_server=False,
     )
     assert env_info["env"] == "colab"
     assert Path(env_info["workspace"]) == fake_drive_workspace.resolve()
@@ -198,7 +200,7 @@ def test_fake_colab_environment_and_drive_mount_simulation(tmp_path, monkeypatch
     assert (fake_drive_gemini / "credentials.json").read_text(encoding="utf-8") == "{\"token\": \"refreshed_in_colab\"}"
 
     # Run Demo 1 inside the simulated Colab Drive workspace
-    demo1 = nl.run_phantom_shape_swarm(agent="python")
+    demo1 = scenarios.run_phantom_shape_swarm(agent="python")
     assert len(demo1["spic6"]["rows"]) == 5
     assert len(demo1["ahsn"]["summary"]) == 3
 
@@ -247,7 +249,7 @@ def test_qshape_loader_bypasses_broken_pydantic_init(isolated_demo_env, tmp_path
         )
 
     monkeypatch.setenv("PYTHONPATH", str(broken_site))
-    res = nl.run_phantom_shape_swarm(agent="python")
+    res = scenarios.run_phantom_shape_swarm(agent="python")
     assert "rows" in res["spic6"]
     assert len(res["spic6"]["rows"]) == 5
     assert res["spic6"]["engine"] == "qradiomics.shape.spiculation_from_voxel"
@@ -277,7 +279,7 @@ def test_opencode_normalization_and_free_demo(isolated_demo_env, monkeypatch):
 
     # Force deterministic fallback in unit test so CI doesn't depend on external network
     monkeypatch.setattr(pty, "find_opencode_bin", lambda: None)
-    res = nl.run_opencode_free_demo()
+    res = scenarios.run_opencode_free_demo()
     assert len(res["swarm"]) == 3
     assert all(r["status"] == "completed" for r in res["swarm"])
     assert "PASS" in res["pipeline"]["final_output"]

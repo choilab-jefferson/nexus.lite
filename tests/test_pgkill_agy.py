@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import nexus_lite.core as nl
+from nexus_lite.demos import orchestration
 
 pytestmark = pytest.mark.usefixtures("isolated_env")
 
@@ -93,6 +94,6 @@ def test_run_pytest_times_out(tmp_path):
     t = tmp_path / "test_hang.py"
     t.write_text("import time\ndef test_h():\n    time.sleep(300)\n")
     t0 = time.monotonic()
-    r = nl._run_pytest([sys.executable, "-m", "pytest", str(t)], str(tmp_path), timeout=2)
+    r = orchestration._run_pytest([sys.executable, "-m", "pytest", str(t)], str(tmp_path), timeout=2)
     assert time.monotonic() - t0 < 12
     assert r.returncode == 124 and "TIMEOUT" in r.stderr

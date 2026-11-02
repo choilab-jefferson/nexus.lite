@@ -11,11 +11,20 @@ import os
 import shutil
 import subprocess
 import tempfile
+import hashlib
+import platform
+import sys
+import urllib.request
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-# Install URL is pending a loom release tag. Set LOOM_INSTALL_URL meanwhile.
+# Pinned released loom binary. Nothing here downloads anything:
+# install_loom() is the only network path and runs only when called explicitly.
+LOOM_VERSION = "0.2.2"
+LOOM_RELEASE_BASE = "https://github.com/choilab-jefferson/nexus.loom/releases/download/v{version}"
+# Optional env override of the release base URL (directory holding the assets).
 LOOM_INSTALL_URL = os.environ.get("LOOM_INSTALL_URL")
 
 MIN_LOOM_VERSION = "0.1.0"
@@ -49,6 +58,61 @@ DEFAULT_EXIT_CODES: Dict[str, int] = {
     "budget": 4,
     "interrupted": 130,
 }
+
+
+def _asset_name(system: Optional[str] = None, machine: Optional[str] = None) -> str:
+    """Release asset name for this platform: loom-{linux,darwin}-{amd64,arm64}."""
+    system = (system or platform.system()).lower()
+    machine = (machine or platform.machine()).lower()
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+    if system not in ("linux", "darwin") or arch is None:
+        raise RuntimeError(
+            f"no released loom binary for {system}/{machine}; "
+            "supported: linux and darwin on amd64/arm64 (build from source otherwise)")
+    return f"loom-{system}-{arch}"
+
+
+def _fetch(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        try:
+            return resp.read()
+        finally:
+            close = getattr(resp, "close", None)
+            if close:
+                close()
+
+
+def install_loom(version: str = LOOM_VERSION, dest: Optional[Union[str, Path]] = None,
+                 base_url: Optional[str] = None) -> Path:
+    """Explicitly download the released loom binary, verify sha256, install it.
+
+    Never called implicitly (no import-time or LoomAdapter side effect). The
+    base URL is `base_url`, else $LOOM_INSTALL_URL, else the GitHub release for
+    `version`. `dest` defaults to ~/.local/bin/loom. Returns the installed path.
+    """
+    asset = _asset_name()
+    base = (base_url or os.environ.get("LOOM_INSTALL_URL")
+            or LOOM_RELEASE_BASE.format(version=version)).rstrip("/")
+    sums = _fetch(f"{base}/checksums.txt").decode("utf-8", "replace")
+    expected = None
+    for line in sums.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == asset:
+            expected = parts[0].lower()
+    if expected is None:
+        raise RuntimeError(f"{asset} not listed in checksums.txt at {base}")
+    data = _fetch(f"{base}/{asset}")
+    actual = hashlib.sha256(data).hexdigest()
+    target = Path(dest).expanduser() if dest else Path.home() / ".local" / "bin" / "loom"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".part")
+    tmp.write_bytes(data)
+    if actual != expected:
+        tmp.unlink()
+        raise RuntimeError(f"sha256 mismatch for {asset}: expected {expected}, got {actual}")
+    tmp.chmod(0o755)
+    os.replace(tmp, target)
+    return target
 
 
 def find_loom() -> Optional[str]:

@@ -12,7 +12,7 @@ Covers:
 - Protocol pointer formatting, parsing, and truncation
 - Role tier rankings and verifier clamping
 - PTY key chord encoding and agent command normalization
-- Lazy loading of optional submodules (bridge, demos, viz)
+- Lazy loading of optional submodules (demos, viz)
 """
 
 import json
@@ -27,7 +27,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 import nexus_lite as nl
-from nexus_lite import bridge, cli, core, protocol, pty, roles
+from nexus_lite import cli, core, protocol, pty, roles
+from nexus_lite._db import connect, get_db
+from nexus_lite.colab import env as colab_env
+from nexus_lite.demos import cli as demo_cli
+from nexus_lite.demos import orchestration, viz
+from nexus_lite.memory import stm as stm_mod
 
 
 @pytest.fixture(autouse=True)
@@ -172,7 +177,7 @@ def test_delegate_execution_and_notification(isolated_env):
     assert (art_dir / "rc").read_text().strip() == "0"
 
     # Check DB record
-    with nl.get_db() as con:
+    with connect() as con:
         row = con.execute("SELECT status, rc FROM tasks WHERE id = ?", (task_id,)).fetchone()
         assert row is not None
         assert row["status"] == "completed"
@@ -287,7 +292,7 @@ def test_delegate_background(isolated_env):
     deadline = time.monotonic() + 5.0
     completed = False
     while time.monotonic() < deadline:
-        with nl.get_db() as con:
+        with connect() as con:
             row = con.execute("SELECT status, rc FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row and row["status"] == "completed":
                 completed = True
@@ -308,7 +313,7 @@ def test_ensure_colab(tmp_path, monkeypatch):
     fake_home.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: fake_home)
 
-    ws = nl.ensure_colab(drive_path=str(drive_dir), gemini_drive_path=str(gemini_drive))
+    ws = colab_env.ensure_colab(drive_path=str(drive_dir), gemini_drive_path=str(gemini_drive))
     assert ws == drive_dir.resolve()
     assert (ws / "lite.db").exists()
     assert (ws / "wiki").exists()
@@ -328,7 +333,7 @@ def test_safe_gemini_drive_sync_no_overwrite(tmp_path):
     drive_dir.mkdir(parents=True)
     (drive_dir / "auth.json").write_text("SAVED_TOKEN", encoding="utf-8")
 
-    ret = nl.sync_dotdir_to_drive(local_dir, drive_dir)
+    ret = colab_env.sync_dotdir_to_drive(local_dir, drive_dir)
     assert ret == drive_dir.resolve()
 
     # Preserves SAVED_TOKEN in drive_dir/auth.json (Drive wins)
@@ -346,7 +351,7 @@ def test_safe_gemini_drive_sync_no_overwrite(tmp_path):
     assert (local_dir / "local_plugin.txt").read_text(encoding="utf-8") == "keep_me"
 
     # Idempotent re-run on existing symlink returns drive_dir
-    ret2 = nl.sync_dotdir_to_drive(local_dir, drive_dir)
+    ret2 = colab_env.sync_dotdir_to_drive(local_dir, drive_dir)
     assert ret2 == drive_dir.resolve()
     assert local_dir.is_symlink()
 
@@ -539,7 +544,7 @@ def test_visualization_dashboard(isolated_env, capsys):
     """
     Test live HTML5/Colab visualization dashboard:
     - Runs after multi-agent activity.
-    - Calls nl.dashboard(display_inline=False) and cli.main(["dashboard"]).
+    - Calls viz.dashboard(display_inline=False) and demo_cli.main(["dashboard"]).
     - Asserts HTML contains SVG topology (<svg), live PTY screen text, task outputs, and bus messages.
     """
     ws = isolated_env
@@ -565,8 +570,8 @@ def test_visualization_dashboard(isolated_env, capsys):
         kind="dm",
     )
 
-    # 3. Call nl.dashboard(display_inline=False)
-    html_content = nl.dashboard(display_inline=False)
+    # 3. Call viz.dashboard(display_inline=False)
+    html_content = viz.dashboard(display_inline=False)
     assert isinstance(html_content, str)
     assert "<!DOCTYPE html>" in html_content
     # Assert SVG topology
@@ -584,7 +589,7 @@ def test_visualization_dashboard(isolated_env, capsys):
 
     # 4. Call CLI subcommand: nexus-lite dashboard
     cli_out_path = ws / "custom_dashboard.html"
-    ret = cli.main(["dashboard", "--out", str(cli_out_path)])
+    ret = demo_cli.main(["dashboard", "--out", str(cli_out_path)])
     assert ret == 0
     assert cli_out_path.exists()
     cli_html = cli_out_path.read_text(encoding="utf-8")
@@ -592,7 +597,7 @@ def test_visualization_dashboard(isolated_env, capsys):
     assert "VIZ_TERMINAL_SCREEN_MARKER_789" in cli_html
 
     # Also test default CLI dashboard path (.nexus/dashboard.html)
-    ret_default = cli.main(["dashboard"])
+    ret_default = demo_cli.main(["dashboard"])
     assert ret_default == 0
     default_p = ws / "dashboard.html"
     assert default_p.exists()
@@ -647,165 +652,29 @@ def test_live_agy_multi_agent_pipeline():
     assert "AGY_VERIFIER_CONFIRMED_SUCCESS" in res["final_output"]
 
 
-def test_bridge_server_and_remote_colab_client(isolated_env):
-    """
-    Test cloudflared remote bridge server and RemoteColab client.
-    Verifies authentication, remote exec, PTY, delegation, swarm, bus, wiki, and dashboard.
-    """
-    import urllib.error
-
-    # 1. Start bridge on ephemeral port without trycloudflare tunnel
-    info = nl.start_bridge(port=0, tunnel=False)
-    assert info["port"] > 0
-    assert info["local_url"].startswith(f"http://127.0.0.1:{info['port']}")
-    assert info["token"]
-    assert "dashboard_url" in info
-
-    try:
-        # 2. Verify unauthorized requests return 401/403
-        bad_remote = nl.RemoteColab(info["local_url"], token="invalid-token-xyz")
-        with pytest.raises(urllib.error.HTTPError) as exc_info:
-            bad_remote.health()
-        assert exc_info.value.code in (401, 403)
-
-        no_token_remote = nl.RemoteColab(info["local_url"], token="")
-        with pytest.raises(urllib.error.HTTPError) as exc_info:
-            no_token_remote.health()
-        assert exc_info.value.code in (401, 403)
-
-        # 3. Authorized client
-        remote = nl.RemoteColab(info["local_url"], info["token"])
-
-        # 4. remote.health()
-        h = remote.health()
-        assert h["status"] == "ok"
-        assert "workspace" in h
-
-        # 5. remote.exec(python="print(6*7)") and remote.exec(cmd=...)
-        py_res = remote.exec(python="print(6*7)")
-        assert py_res["rc"] == 0
-        assert "42" in py_res["stdout"].strip()
-
-        # Verify stdin=subprocess.DEVNULL: stdin reads encounter immediate EOF rather than hanging
-        py_devnull = remote.exec(python="import sys; print('STDIN_EOF:', len(sys.stdin.read()))")
-        assert py_devnull["rc"] == 0
-        assert "STDIN_EOF: 0" in py_devnull["stdout"]
-
-        cmd_res = remote.exec(cmd="echo 'BRIDGE_EXEC_OK'")
-        assert cmd_res["rc"] == 0
-        assert "BRIDGE_EXEC_OK" in cmd_res["stdout"]
-
-        cmd_devnull = remote.exec(cmd="head -n 1")
-        assert cmd_devnull["rc"] == 0
-
-        # 6. remote.pty_spawn / pty_send / pty_read / pty_kill
-        if shutil.which("dtach"):
-            sess = remote.pty_spawn("bash --norc", name="rem-pty-test")
-            assert sess == "rem-pty-test"
-            remote.pty_send(sess, "echo 'REMOTE_PTY_HELLO'", enter=True)
-            screen = remote.pty_wait(sess, provider="bash", timeout=5.0)
-            assert "REMOTE_PTY_HELLO" in screen
-            remote.pty_kill(sess)
-
-        # 7. remote.delegate
-        del_res = remote.delegate(
-            agent_cmd="python3 -c 'print(\"REMOTE_DELEGATE_SUCCESS\")'",
-            prompt="Compute result",
-            caller="main",
-            timeout=30.0,
-        )
-        assert del_res["status"] == "completed"
-        assert del_res["rc"] == 0
-        assert "REMOTE_DELEGATE_SUCCESS" in del_res["output"]
-
-        # 8. remote.run_swarm
-        swarm_specs = [
-            {"task_id": "sw-rem-1", "cmd": "python3 -c 'print(\"SWARM_1\")'", "prompt": "p1"},
-            {"task_id": "sw-rem-2", "cmd": "python3 -c 'print(\"SWARM_2\")'", "prompt": "p2"},
-        ]
-        swarm_res = remote.run_swarm(swarm_specs, caller="orchestrator", timeout=30.0)
-        assert len(swarm_res) == 2
-        assert all(r["status"] == "completed" for r in swarm_res)
-        assert "SWARM_1" in swarm_res[0]["output"]
-        assert "SWARM_2" in swarm_res[1]["output"]
-
-        # 9. remote.bus_send / bus_read
-        msg = remote.bus_send(target="test-agent", message="Ping from RemoteColab", sender="client", kind="dm")
-        assert msg["id"]
-        assert msg["target"] == "test-agent"
-        msgs = remote.bus_read(target="test-agent", limit=10)
-        assert any(m["id"] == msg["id"] for m in msgs)
-
-        # 10. remote.wiki_write / wiki_search / wiki_read
-        path = remote.wiki_write("docs/remote_bridge", "# Remote Bridge\nZero-tunnel testing.")
-        assert path
-        read_content = remote.wiki_read("docs/remote_bridge")
-        assert "Zero-tunnel testing" in read_content
-        hits = remote.wiki_search("Zero-tunnel")
-        assert len(hits) >= 1
-        assert hits[0]["slug"] == "docs/remote_bridge"
-
-        # 11. remote.dashboard_html()
-        html = remote.dashboard_html()
-        assert "<!DOCTYPE html>" in html or "html" in html.lower()
-
-    finally:
-        # 12. stop_bridge()
-        nl.stop_bridge()
-
-
-def test_cli_bridge(isolated_env, capsys):
-    """Test CLI commands for bridge status, exec, and stop."""
-    info = nl.start_bridge(port=0, tunnel=False)
-    try:
-        # bridge status
-        rc = cli.main(["bridge", "status"])
-        assert rc == 0
-        captured = capsys.readouterr()
-        assert str(info["port"]) in captured.out
-
-        # bridge exec
-        rc = cli.main(["bridge", "exec", "echo 'CLI_EXEC_HELLO'", "--url", info["local_url"], "--token", info["token"]])
-        assert rc == 0
-        captured = capsys.readouterr()
-        assert "CLI_EXEC_HELLO" in captured.out
-    finally:
-        nl.stop_bridge()
-
-
-def test_ensure_cloudflared_unit(monkeypatch, tmp_path):
-    """Verify ensure_cloudflared discovers binary from PATH."""
-    fake_bin = tmp_path / "cloudflared"
-    fake_bin.write_text("#!/bin/sh\necho fake\n")
-    fake_bin.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
-    p = bridge.ensure_cloudflared()
-    assert Path(p).is_file()
-
-
-def test_dashboard_2x2_layout_and_bridge_buttons(isolated_env):
-    """Test compact 2x2 responsive widescreen grid and bridge.json external action buttons."""
+def test_dashboard_2x2_layout_and_tunnel_buttons(isolated_env):
+    """Test compact 2x2 responsive widescreen grid and tunnel.json external action buttons."""
     ws = isolated_env
 
-    # 1. Without bridge.json
-    html_nobridge = nl.render_dashboard_html()
-    assert "minmax(420px, 1fr)" in html_nobridge
-    assert "max-height: 280px" in html_nobridge
-    assert "Open Live Dashboard (Cloudflare Tunnel) ↗" not in html_nobridge
+    # 1. Without tunnel.json
+    html_notunnel = viz.render_dashboard_html()
+    assert "minmax(420px, 1fr)" in html_notunnel
+    assert "max-height: 280px" in html_notunnel
+    assert "Open Live Dashboard (Cloudflare Tunnel) ↗" not in html_notunnel
 
-    # 2. Write bridge.json with dashboard_url and colab_dashboard_url
+    # 2. Write tunnel.json with dashboard_url and colab_dashboard_url
     binfo = {
         "dashboard_url": "https://test-subdomain.trycloudflare.com/dashboard?token=xyz123",
         "colab_dashboard_url": "https://colab-proxy.googleusercontent.com/dashboard?token=xyz123",
     }
-    (ws / "bridge.json").write_text(json.dumps(binfo), encoding="utf-8")
+    (ws / "tunnel.json").write_text(json.dumps(binfo), encoding="utf-8")
 
-    html_with_bridge = nl.render_dashboard_html()
-    assert "Open Live Dashboard (Cloudflare Tunnel) ↗" in html_with_bridge
-    assert 'href="https://test-subdomain.trycloudflare.com/dashboard?token=xyz123&refresh=3"' in html_with_bridge
-    assert 'target="_blank"' in html_with_bridge
-    assert "Open Live Dashboard (Colab Proxy) ↗" in html_with_bridge
-    assert 'href="https://colab-proxy.googleusercontent.com/dashboard?token=xyz123"' in html_with_bridge
+    html_with_tunnel = viz.render_dashboard_html()
+    assert "Open Live Dashboard (Cloudflare Tunnel) ↗" in html_with_tunnel
+    assert 'href="https://test-subdomain.trycloudflare.com/dashboard?token=xyz123&refresh=3"' in html_with_tunnel
+    assert 'target="_blank"' in html_with_tunnel
+    assert "Open Live Dashboard (Colab Proxy) ↗" in html_with_tunnel
+    assert 'href="https://colab-proxy.googleusercontent.com/dashboard?token=xyz123"' in html_with_tunnel
 
 
 def test_dashboard_ipython_display_return_none(monkeypatch):
@@ -829,13 +698,13 @@ def test_dashboard_ipython_display_return_none(monkeypatch):
     monkeypatch.setitem(sys.modules, "IPython.display", ipd_mod)
 
     # Default return_html=False -> should display and return None
-    res = nl.dashboard(display_inline=True, return_html=False)
+    res = viz.dashboard(display_inline=True, return_html=False)
     assert res is None
     assert len(displayed) >= 1
     assert "<!DOCTYPE html>" in displayed[-1].data
 
     # Explicit return_html=True -> returns html
-    res_html = nl.dashboard(display_inline=True, return_html=True)
+    res_html = viz.dashboard(display_inline=True, return_html=True)
     assert isinstance(res_html, str)
     assert "<!DOCTYPE html>" in res_html
 
@@ -857,38 +726,15 @@ def test_colab_poll_callback_and_button(monkeypatch):
     monkeypatch.setitem(sys.modules, "google.colab", colab_mod)
     monkeypatch.setitem(sys.modules, "google.colab.output", output_mod)
 
-    html = nl.render_dashboard_html()
+    html = viz.render_dashboard_html()
     assert "↻ Auto-Poll (Colab Fullscreen)" in html
     assert "nexus_lite.poll_dashboard" in html
 
-    nl.dashboard(display_inline=False)
+    viz.dashboard(display_inline=False)
     assert "nexus_lite.poll_dashboard" in callbacks
     data = callbacks["nexus_lite.poll_dashboard"]()
     assert "html" in data
     assert "Nexus-Lite Multi-Agent Dashboard" in data["html"]
-
-
-def test_bridge_refresh_meta_tag(isolated_env):
-    """Test /dashboard?refresh=3 and /?refresh=3 inject auto-refresh meta tag."""
-    import urllib.request
-
-    info = nl.start_bridge(port=0, tunnel=False)
-    try:
-        hdr = {"Authorization": f"Bearer {info['token']}"}
-        url_with_refresh = f"{info['local_url']}/dashboard?refresh=3"
-        req = urllib.request.Request(url_with_refresh, headers=hdr)
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            content = resp.read().decode("utf-8")
-        assert "<meta http-equiv='refresh' content='3'>" in content
-
-        # Also test root path /?token=...&refresh=5
-        url_root = f"{info['local_url']}/?refresh=5"
-        req_root = urllib.request.Request(url_root, headers=hdr)
-        with urllib.request.urlopen(req_root, timeout=5.0) as resp:
-            root_content = resp.read().decode("utf-8")
-        assert "<meta http-equiv='refresh' content='5'>" in root_content
-    finally:
-        nl.stop_bridge()
 
 
 def test_roles_exports_and_dispatch():
@@ -931,27 +777,27 @@ def test_colab_demo_notebook_compiles():
 def test_detect_env_variants(monkeypatch):
     """Test detect_env detection across Colab, Codespaces, Devcontainer, Docker, and Local."""
     # 1. Default on current system
-    current = nl.detect_env()
+    current = colab_env.detect_env()
     assert current in ("colab", "codespaces", "devcontainer", "docker", "local")
 
     # 2. Google Colab via sys.modules
     monkeypatch.setitem(sys.modules, "google.colab", object())
-    assert nl.detect_env() == "colab"
+    assert colab_env.detect_env() == "colab"
     monkeypatch.delitem(sys.modules, "google.colab")
 
     # Google Colab via environment variable
     monkeypatch.setenv("COLAB_RELEASE_TAG", "release-20241028")
-    assert nl.detect_env() == "colab"
+    assert colab_env.detect_env() == "colab"
     monkeypatch.delenv("COLAB_RELEASE_TAG")
 
     # 3. GitHub Codespaces
     monkeypatch.setenv("CODESPACES", "true")
-    assert nl.detect_env() == "codespaces"
+    assert colab_env.detect_env() == "codespaces"
     monkeypatch.delenv("CODESPACES")
 
     # 4. Dev Container via REMOTE_CONTAINERS
     monkeypatch.setenv("REMOTE_CONTAINERS", "true")
-    assert nl.detect_env() == "devcontainer"
+    assert colab_env.detect_env() == "devcontainer"
     monkeypatch.delenv("REMOTE_CONTAINERS")
 
     # Dev Container via /.dockerenv and /workspaces
@@ -963,7 +809,7 @@ def test_detect_env_variants(monkeypatch):
         return original_exists(self)
 
     monkeypatch.setattr(Path, "exists", mock_exists_devcontainer)
-    assert nl.detect_env() == "devcontainer"
+    assert colab_env.detect_env() == "devcontainer"
 
     # 5. Generic Docker container
     def mock_exists_docker(self):
@@ -974,7 +820,7 @@ def test_detect_env_variants(monkeypatch):
         return original_exists(self)
 
     monkeypatch.setattr(Path, "exists", mock_exists_docker)
-    assert nl.detect_env() == "docker"
+    assert colab_env.detect_env() == "docker"
 
     # 6. Local fallback
     def mock_exists_local(self):
@@ -987,18 +833,17 @@ def test_detect_env_variants(monkeypatch):
     monkeypatch.delenv("REMOTE_CONTAINERS", raising=False)
     monkeypatch.delenv("COLAB_RELEASE_TAG", raising=False)
     sys.modules.pop("google.colab", None)
-    assert nl.detect_env() == "local"
+    assert colab_env.detect_env() == "local"
 
 
 def test_ensure_env_functionality(tmp_path, monkeypatch):
     """Test ensure_env across non-colab and colab simulated environments."""
     ws = tmp_path / "env_ws"
 
-    # Non-colab test with start_bridge_server=False
-    res = nl.ensure_env(workspace=ws, start_bridge_server=False)
+    # Non-colab test
+    res = colab_env.ensure_env(workspace=ws)
     assert res["env"] in ("colab", "codespaces", "devcontainer", "docker", "local")
     assert res["workspace"] == ws
-    assert res["bridge"] is None
     assert (ws / "inbox").exists()
     assert (ws / "artifacts").exists()
     assert (ws / "wiki").exists()
@@ -1008,10 +853,9 @@ def test_ensure_env_functionality(tmp_path, monkeypatch):
     colab_ws = tmp_path / "colab_ws"
     monkeypatch.setitem(sys.modules, "google.colab", object())
     try:
-        colab_res = nl.ensure_env(workspace=colab_ws, mount_drive=False, start_bridge_server=False)
+        colab_res = colab_env.ensure_env(workspace=colab_ws, mount_drive=False)
         assert colab_res["env"] == "colab"
         assert colab_res["workspace"] == colab_ws
-        assert colab_res["bridge"] is None
         assert (colab_ws / "lite.db").exists()
     finally:
         sys.modules.pop("google.colab", None)
@@ -1115,22 +959,28 @@ def test_pty_key_to_bytes_and_agent_normalization(monkeypatch):
 
 
 def test_lazy_loading_extras():
-    """Verify importing nexus_lite does not eagerly import bridge, demos, or viz until accessed."""
+    """Verify importing nexus_lite does not eagerly import demos, viz, or compute until accessed, and never loads colab."""
     code = (
         "import sys, nexus_lite as nl; "
-        "assert 'nexus_lite.core' in sys.modules; "
+        "assert 'nexus_lite.core' not in sys.modules; "
+        "assert 'nexus_lite.compute' not in sys.modules; "
+        "assert not any(m.startswith('nexus_lite.memory') for m in sys.modules); "
         "assert 'nexus_lite.pty' in sys.modules; "
         "assert 'nexus_lite.roles' in sys.modules; "
         "assert 'nexus_lite.protocol' in sys.modules; "
-        "assert 'nexus_lite.bridge' not in sys.modules; "
+        "assert 'nexus_lite.colab' not in sys.modules; "
         "assert 'nexus_lite.demos' not in sys.modules; "
-        "assert 'nexus_lite.viz' not in sys.modules; "
-        "_ = nl.render_dashboard_html; "
-        "assert 'nexus_lite.viz' in sys.modules; "
-        "_ = nl.RemoteColab; "
-        "assert 'nexus_lite.bridge' in sys.modules; "
+        "assert 'nexus_lite.demos.viz' not in sys.modules; "
+        "_ = nl.get_workspace; "
+        "assert 'nexus_lite.core' not in sys.modules; "
+        "import warnings; warnings.simplefilter('ignore', DeprecationWarning); "
+        "_ = nl.render_dashboard_html; "  # deprecated name -> lazy demos.viz
+        "assert 'nexus_lite.demos.viz' in sys.modules; "
         "_ = nl.run_all_demos; "
-        "assert 'nexus_lite.demos' in sys.modules"
+        "assert 'nexus_lite.demos' in sys.modules; "
+        "_ = nl.compute_run; "
+        "assert 'nexus_lite.compute' in sys.modules; "
+        "assert 'nexus_lite.colab' not in sys.modules"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code],
@@ -1163,19 +1013,19 @@ def test_stm_and_escalation_integration(isolated_env):
     # 2. Native file-backed STM (`stm/1`) and pure-Python `<nexus_stm>` packing
     stm_nodes = nl.stm_list(workspace=isolated_env)
     assert len(stm_nodes) >= 1
-    esc_stm_id = nl.stm.node_id_for_task("t-esc-test")
+    esc_stm_id = stm_mod.node_id_for_task("t-esc-test")
     esc_node = nl.stm_read(esc_stm_id, workspace=isolated_env)
     assert esc_node is not None
     assert esc_node["schema"] == "stm/1"
     assert esc_node["status"] == "needs-human"
 
     # Prove Files are the Source of Truth and SQLite `tasks` is rebuildable from `stm-<pid>/node/*.md`
-    with nl.get_db() as con:
+    with connect() as con:
         con.execute("DELETE FROM tasks;")
         assert con.execute("SELECT COUNT(*) FROM tasks;").fetchone()[0] == 0
     rebuilt = nl.stm_rebuild_index(isolated_env)
     assert rebuilt >= 1
-    with nl.get_db() as con:
+    with connect() as con:
         assert con.execute("SELECT COUNT(*) FROM tasks;").fetchone()[0] >= 1
 
     (isolated_env / "AGENTS.md").write_text("# Workspace Agents\nMaintain zero-dependency kernel.\n", encoding="utf-8")
@@ -1225,7 +1075,7 @@ def test_multi_tier_swarm_orchestration(isolated_env):
     fake_t2 = f"{py} -c 'print(\"TIER2_AGY_VERIFIED_SYNTHESIS_OK\")'"
 
     # 1. Full 3-tier pipeline with Tier-0 (mock provider) + Tier-1 Swarm + Tier-2 Verifier
-    res = nl.run_multi_tier_swarm(
+    res = orchestration.run_multi_tier_swarm(
         "Design and verify multi-tier swarm orchestration",
         workspace=isolated_env,
         tier0_provider="mock",
@@ -1255,7 +1105,7 @@ def test_multi_tier_swarm_orchestration(isolated_env):
     assert len(stm_nodes) >= 4
 
     # 2. Strict PHI mode (`phi=True`) confines execution to Tier-0 and blocks Tier-1/Tier-2 cloud stages
-    res_phi = nl.run_multi_tier_swarm(
+    res_phi = orchestration.run_multi_tier_swarm(
         "Analyze confidential PHI cohort locally",
         workspace=isolated_env,
         phi=True,
@@ -1270,7 +1120,7 @@ def test_multi_tier_swarm_orchestration(isolated_env):
     assert res_phi["phi"] is True
 
     # 3. Verify Agent-to-Agent (A2A) interaction and SVG peer-to-peer DM edges in dashboard
-    a2a_res = nl.run_agent_interaction(
+    a2a_res = orchestration.run_agent_interaction(
         "Implement sample helper in helper.py",
         target_file="helper.py",
         workspace=isolated_env,
@@ -1290,7 +1140,7 @@ def test_multi_tier_swarm_orchestration(isolated_env):
     assert a2a_res["dm_chain"][3]["sender"] == "code-driver"
     assert a2a_res["dm_chain"][3]["target"] == "agy-architect"
 
-    dash_html = nl.render_dashboard_html()
+    dash_html = viz.render_dashboard_html()
     assert "PEER AGENT" in dash_html
     assert "dm:m-" in dash_html
     assert "agy-architect" in dash_html
@@ -1312,7 +1162,7 @@ def test_cooperative_multi_agent_problem_solving(isolated_env):
     - Phase 5: Final `pytest` verification passes 100% (`final_pytest_rc == 0`, `6 passed`), broadcasts
       `COOP_SOLVE_COMPLETE`, indexes full report in FTS5 Wiki, and renders HTML5 topology dashboard.
     """
-    res = nl.run_cooperative_problem_solver(
+    res = orchestration.run_cooperative_problem_solver(
         workspace=isolated_env,
         architect_agent="python",
         wiki_slug="coop/test_solution",
@@ -1413,7 +1263,7 @@ def test_bg_delegate_reaches_terminal_status_via_detached_runner():
 
 
 def _insert_running(task_id, art, created):
-    with core.get_db() as con:
+    with core.connect() as con:
         con.execute(
             "INSERT INTO tasks (id, caller, agent_cmd, status, rc, created_at, completed_at, artifact_dir)"
             " VALUES (?, 'main', 'x', 'running', NULL, ?, NULL, ?);",
@@ -1449,19 +1299,107 @@ def test_cli_delegate_exit_codes(capsys):
 
 
 def test_cli_multi_tier_and_interact_propagate_failure(monkeypatch, capsys):
-    monkeypatch.setattr(core, "run_multi_tier_swarm", lambda *a, **k: {"tier2_result": {"status": "failed"}})
-    assert cli.main(["multi-tier", "goal"]) == 1
-    monkeypatch.setattr(core, "run_agent_interaction", lambda *a, **k: {"turns": [{"result": {"status": "timeout"}}]})
-    assert cli.main(["interact", "goal"]) == 124
+    monkeypatch.setattr(orchestration, "run_multi_tier_swarm", lambda *a, **k: {"tier2_result": {"status": "failed"}})
+    assert demo_cli.main(["multi-tier", "goal"]) == 1
+    monkeypatch.setattr(orchestration, "run_agent_interaction", lambda *a, **k: {"turns": [{"result": {"status": "timeout"}}]})
+    assert demo_cli.main(["interact", "goal"]) == 124
 
 
 def test_delegate_timeout_bounded_when_escaped_grandchild_holds_pipe():
-    marker = f"sleep 31.{os.getpid()}"
+    marker = f"escaped_grandchild_{os.getpid()}"
+    cmd = (
+        f"{sys.executable} -c "
+        f"\"import subprocess, time; "
+        f"subprocess.Popen(['sh', '-c', 'sleep 31 #{marker}'], start_new_session=True); "
+        f"time.sleep(31)\""
+    )
     t0 = time.monotonic()
     try:
-        res = core.delegate(f"sh -c 'setsid {marker} & wait'", "x", timeout=1)
+        res = core.delegate(cmd, "x", timeout=1)
         elapsed = time.monotonic() - t0
         assert res["status"] == "timeout"
         assert elapsed < 10, f"communicate() not bounded: {elapsed:.1f}s"
     finally:
         subprocess.run(["pkill", "-f", marker])
+
+
+def test_compute_local_sandbox_and_file_collection(tmp_path):
+    """Verify pack_self_contained_script and run_local_sandbox execute nexus_lite with zero pre-installed site-packages."""
+    res = nl.compute_run(
+        "local",
+        python=(
+            "nl.stm_write('n1', kind='task', status='completed', summary='shipped ok')\n"
+            "(JOB_DIR / 'out.txt').write_text((JOB_DIR / 'in.txt').read_text().upper(), encoding='utf-8')\n"
+            "RESULT = {'stm': len(nl.stm_list()), 'ver': nl.__version__}\n"
+        ),
+        files={"in.txt": "hello remote lite"},
+        collect_files=["out.txt"],
+    )
+    assert res["ok"] is True
+    assert res["result"] == {"stm": 1, "ver": nl.__version__}
+    assert res["artifacts"]["out.txt"] == "HELLO REMOTE LITE"
+
+
+def test_compute_colab_bootstrap_and_tunnel(tmp_path):
+    """Verify run_on_colab generates a standalone runnable script and also works over an active HTTP tunnel."""
+    from nexus_lite.colab import tunnel as colab_tunnel
+
+    script_out = tmp_path / "colab_bundle.py"
+    boot = nl.run_on_colab(
+        python="nl.wiki_write('colab/boot', '# Bootstrapped'); RESULT = len(nl.wiki_list())",
+        bootstrap_out=str(script_out),
+    )
+    assert boot["ok"] is True
+    assert boot["mode"] == "bootstrap"
+    assert script_out.is_file()
+
+    # Execute the standalone bootstrap script in an isolated Python process (-I)
+    env = dict(os.environ)
+    env["NEXUS_LITE_RUNTIME_ROOT"] = str(tmp_path / "bare_colab_runtime")
+    env.pop("PYTHONPATH", None)
+    proc = subprocess.run([sys.executable, "-I", str(script_out)], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0
+    parsed = nl.compute.parse_runner_output(proc.stdout, proc.stderr, proc.returncode)
+    assert parsed["ok"] is True
+    assert parsed["result"] == 1
+
+    # Also test sending the self-extracting bundle over a live local Colab tunnel server
+    info = colab_tunnel.start_tunnel(port=0, tunnel=False)
+    try:
+        tok = colab_tunnel.token_file_path(info["port"]).read_text(encoding="utf-8").strip()
+        tun_res = nl.run_on_colab(
+            lite_argv=["stm", "list"],
+            url=info["local_url"],
+            token=tok,
+        )
+        assert tun_res["ok"] is True
+        assert json.loads(tun_res["stdout"]) == []
+    finally:
+        colab_tunnel.stop_tunnel()
+
+
+def test_compute_turing_ssh_and_srun_mocked(monkeypatch, tmp_path):
+    """Verify run_on_turing executes ssh and srun staging scripts end-to-end when SSH is mocked."""
+    def fake_ssh_stdin(host, remote_cmd, stdin_text, timeout=300.0, jump_host=None):
+        env = dict(os.environ)
+        env["HOME"] = str(tmp_path)
+        env["NEXUS_LITE_RUNTIME_ROOT"] = str(tmp_path / ".cache" / "nexus_lite")
+        return subprocess.run(
+            [sys.executable, "-I", "-"],
+            input=stdin_text,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(nl.compute, "_run_ssh_stdin", fake_ssh_stdin)
+    res = nl.run_on_turing(
+        mode="ssh",
+        python="nl.stm_write('t1', kind='task', status='completed', summary='turing ok'); RESULT = len(nl.stm_list())",
+    )
+    assert res["ok"] is True
+    assert res["target"] == "turing"
+    assert res["mode"] == "ssh"
+    assert res["result"] == 1
+

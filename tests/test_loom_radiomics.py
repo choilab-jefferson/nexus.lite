@@ -3,10 +3,10 @@ import os
 
 import pytest
 
-from nexus_lite import loom_multi_agent as m
-from nexus_lite.loom_radiomics_tasks import TASKS
+from nexus_lite.demos import loom_multi_agent as m
+from nexus_lite.demos.loom_radiomics_tasks import TASKS
 
-NAMES = ["radiomics-firstorder", "radiomics-texture", "radiomics-stats", "radiomics-suv"]
+NAMES = ["radiomics-firstorder", "radiomics-texture", "radiomics-stats"]
 
 
 def _quiet(*_a, **_k):
@@ -79,11 +79,35 @@ def test_mock_end_to_end_and_no_prompt_leak(name, tmp_path, monkeypatch):
 
 
 def test_cli_main_runs_all_radiomics_tasks(tmp_path, capsys):
-    from nexus_lite.loom_radiomics_tasks import DEFAULT_TASKS
+    from nexus_lite.demos.loom_radiomics_tasks import DEFAULT_TASKS
     rc = m.main(["--providers", "mock", "--no-baseline", "--task", DEFAULT_TASKS,
                  "--json-out", str(tmp_path / "o.json")])
     assert rc == 0
     import json
-    runs = json.load(open(tmp_path / "o.json"))["runs"]
+    runs = json.loads((tmp_path / "o.json").read_text())["runs"]
     assert [r["task"] for r in runs] == NAMES and all(r["ok"] for r in runs)
     assert "radiomics-stats" in capsys.readouterr().out
+
+
+def test_remote_compute_and_loom_example_and_colab_notebook(tmp_path):
+    from pathlib import Path
+    from examples.remote_compute_and_loom import run_loom_radiomics_on_compute
+
+    bundle_out = tmp_path / "loom_colab_bundle.py"
+    res_boot = run_loom_radiomics_on_compute(target="colab", bootstrap_out=str(bundle_out))
+    assert res_boot["ok"] is True
+    assert bundle_out.is_file()
+
+    res_tunnel = run_loom_radiomics_on_compute(target="colab", ephemeral_tunnel=True)
+    assert res_tunnel["ok"] is True
+    rep = res_tunnel["result"]
+    assert rep["all_passed"] is True
+    assert rep["total_hidden_passed"] == 93
+    assert rep["total_hidden_tests"] == 93
+
+    nb_path = Path(__file__).resolve().parent.parent / "notebooks" / "loom_multi_agent_colab.ipynb"
+    nb_text = nb_path.read_text(encoding="utf-8")
+    for task_name in NAMES:
+        assert task_name in nb_text
+    assert "colab_tunnel" in nb_text
+

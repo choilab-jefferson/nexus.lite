@@ -4,13 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-lite"
-version = "0.2.1"
+version = "0.2.2"
 description = "Ultra-simple Colab-ready multi-agent primitives for Nexus"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Wookjin Choi", email = "wookjin.choi@jefferson.edu" }]
+keywords = ["agents", "multi-agent", "colab", "pty", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "pyte>=0.8.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/choilab-jefferson/nexus.lite"
+Issues = "https://github.com/choilab-jefferson/nexus.lite/issues"
+Changelog = "https://github.com/choilab-jefferson/nexus.lite/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
@@ -25,6 +43,8 @@ demos = [
 
 [project.scripts]
 nexus-lite = "nexus_lite.cli:main"
+nexus-lite-colab = "nexus_lite.colab.tunnel:main"
+nexus-lite-demo = "nexus_lite.demos.cli:main"
 
 [tool.setuptools]
-packages = ["nexus_lite"]
+packages = ["nexus_lite", "nexus_lite.colab", "nexus_lite.demos", "nexus_lite.memory"]
