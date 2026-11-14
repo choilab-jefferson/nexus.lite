@@ -2,7 +2,8 @@
 nexus_lite._db — workspace path + SQLite WAL connection + schema bootstrap.
 
 Shared by the memory tiers (stm/mtm/ltm) and the task/session code in core. Stdlib
-only; imports no other nexus_lite module at import time.
+only; imports no nexus_lite module at import time except the stdlib-only `artifacts`
+(private mkdir helper).
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ import sqlite3
 import threading
 from pathlib import Path
 from typing import Iterator, Optional, Union
+
+from .artifacts import mkdir_private
 
 
 def get_workspace() -> Path:
@@ -29,11 +32,11 @@ def get_db_path() -> Path:
 
 
 def mark_session(name: str, live: bool) -> None:
-    """Best-effort: flip an EXISTING sessions-registry row live/unregistered (lite#8).
+    """Best-effort: flip an EXISTING sessions-registry row live/unregistered.
 
     Update-only and never creates the workspace/DB: a socket with no row already counts as
     live on the bus, so only a stale 'unregistered' row (or a kill) needs a write. Called by
-    pty.spawn / pty.kill (edge pty -> _db; _db imports no lite module, so no cycle).
+    pty.spawn / pty.kill (edge pty -> _db; _db imports only stdlib-only artifacts, so no cycle).
     """
     try:
         if not get_db_path().exists():
@@ -85,7 +88,7 @@ def _m1_stamp_baseline(con: sqlite3.Connection) -> None:
 
 
 def _m2_bus_v1(con: sqlite3.Connection) -> None:
-    """v1 -> v2 (lite#8): messages.seq (backfilled), bus_cursors, bus_meta, sessions.last_seen."""
+    """v1 -> v2: messages.seq (backfilled), bus_cursors, bus_meta, sessions.last_seen."""
     cols = {r[1] for r in con.execute("PRAGMA table_info(messages);")}
     if "seq" not in cols:
         con.execute("ALTER TABLE messages ADD COLUMN seq INTEGER;")
@@ -104,7 +107,32 @@ def _m2_bus_v1(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE sessions ADD COLUMN last_seen REAL;")
 
 
-MIGRATIONS = [_m1_stamp_baseline, _m2_bus_v1]  # index i migrates v<i> -> v<i+1>
+def _m3_bus_consumers(con: sqlite3.Connection) -> None:
+    """v2 -> v3: bus_cursors PK (target) -> (target, consumer); old rows become consumer ''."""
+    cols = {r[1] for r in con.execute("PRAGMA table_info(bus_cursors);")}
+    if "consumer" in cols:
+        return
+    con.execute("ALTER TABLE bus_cursors RENAME TO bus_cursors_old;")
+    con.execute(
+        "CREATE TABLE bus_cursors (target TEXT NOT NULL, consumer TEXT NOT NULL DEFAULT '', "
+        "acked_seq INTEGER NOT NULL DEFAULT 0, updated REAL, PRIMARY KEY (target, consumer));"
+    )
+    con.execute(
+        "INSERT INTO bus_cursors (target, consumer, acked_seq, updated) "
+        "SELECT target, '', acked_seq, updated FROM bus_cursors_old;"
+    )
+    con.execute("DROP TABLE bus_cursors_old;")
+
+
+def _m4_cas_objects(con: sqlite3.Connection) -> None:
+    """v3 -> v4: index of content-addressed blobs (bytes live under .nexus/cas)."""
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS cas_objects (sha256 TEXT PRIMARY KEY, size INTEGER NOT NULL, "
+        "created_at REAL NOT NULL, first_task_id TEXT);"
+    )
+
+
+MIGRATIONS = [_m1_stamp_baseline, _m2_bus_v1, _m3_bus_consumers, _m4_cas_objects]  # index i migrates v<i> -> v<i+1>
 SCHEMA_VERSION = len(MIGRATIONS)
 
 _BASE_DDL = (
@@ -178,10 +206,8 @@ def init(
     if not force and key in _INIT_DONE and Path(key).exists() and (ws / "inbox").is_dir():
         return ws
 
-    ws.mkdir(parents=True, exist_ok=True)
-    (ws / "inbox").mkdir(parents=True, exist_ok=True)
-    (ws / "artifacts").mkdir(parents=True, exist_ok=True)
-    (ws / "wiki").mkdir(parents=True, exist_ok=True)
+    for d in (ws, ws / "inbox", ws / "artifacts", ws / "wiki"):
+        mkdir_private(d)  # workspace holds prompts, outputs and messages: owner-only (0700)
     try:
         from .memory import stm as _stm  # lazy: keeps _db import-free of the tiers
 

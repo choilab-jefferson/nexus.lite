@@ -18,6 +18,14 @@ Covers:
 import json
 import os
 import shutil
+
+import os as _os
+
+
+def live_agent_enabled() -> bool:
+    """Live agent tests call the real agy/claude CLI with the user's own login (model calls, cost, sessions recorded
+    in ~/.gemini or ~/.claude that a lab viewer then shows). They run only when asked: NEXUS_LITE_LIVE_AGENT=1."""
+    return _os.environ.get("NEXUS_LITE_LIVE_AGENT") == "1"
 import subprocess
 import sys
 import time
@@ -397,12 +405,12 @@ def test_cli_pty_and_delegate(isolated_env, capsys):
 def test_agy_normalization():
     """Verify command normalization for agy in pty and oneshot modes."""
     # PTY mode
-    assert pty.normalize_agent_cmd("agy", mode="pty") == "agy --dangerously-skip-permissions"
+    assert pty.normalize_agent_cmd("agy", mode="pty", declutter=False) == "agy --dangerously-skip-permissions"
     assert (
-        pty.normalize_agent_cmd("agy --dangerously-skip-permissions", mode="pty")
+        pty.normalize_agent_cmd("agy --dangerously-skip-permissions", mode="pty", declutter=False)
         == "agy --dangerously-skip-permissions"
     )
-    assert pty.normalize_agent_cmd(["agy"], mode="pty") == "agy --dangerously-skip-permissions"
+    assert pty.normalize_agent_cmd(["agy"], mode="pty", declutter=False) == "agy --dangerously-skip-permissions"
 
     # Oneshot mode
     oneshot_cmd = pty.normalize_agent_cmd("agy", mode="oneshot", prompt="hello world")
@@ -414,7 +422,8 @@ def test_agy_normalization():
     assert pty.normalize_agent_cmd(["ls", "-la"], mode="pty") == ["ls", "-la"]
 
 
-@pytest.mark.skipif(shutil.which("agy") is None, reason="agy binary not available")
+@pytest.mark.skipif(shutil.which("agy") is None or not live_agent_enabled(),
+                    reason="live agent test: needs agy and NEXUS_LITE_LIVE_AGENT=1")
 def test_live_agy_delegate_oneshot():
     """Verify live agy execution via delegate in oneshot mode."""
     res = nl.delegate(
@@ -605,7 +614,8 @@ def test_visualization_dashboard(isolated_env, capsys):
     pty.kill(sess_name)
 
 
-@pytest.mark.skipif(shutil.which("agy") is None, reason="agy binary not available")
+@pytest.mark.skipif(shutil.which("agy") is None or not live_agent_enabled(),
+                    reason="live agent test: needs agy and NEXUS_LITE_LIVE_AGENT=1")
 def test_live_agy_multi_agent_pipeline():
     """
     Test 2-stage live agy pipeline (driver -> verifier).
@@ -1378,9 +1388,9 @@ def test_compute_colab_bootstrap_and_tunnel(tmp_path):
         colab_tunnel.stop_tunnel()
 
 
-def test_compute_turing_ssh_and_srun_mocked(monkeypatch, tmp_path):
-    """Verify run_on_turing executes ssh and srun staging scripts end-to-end when SSH is mocked."""
-    def fake_ssh_stdin(host, remote_cmd, stdin_text, timeout=300.0, jump_host=None):
+def test_compute_colab_ssh_mocked(monkeypatch, tmp_path):
+    """Verify run_on_colab over SSH executes the staged runner end-to-end when SSH is mocked."""
+    def fake_ssh_stdin(host, remote_cmd, stdin_text, timeout=300.0):
         env = dict(os.environ)
         env["HOME"] = str(tmp_path)
         env["NEXUS_LITE_RUNTIME_ROOT"] = str(tmp_path / ".cache" / "nexus_lite")
@@ -1394,12 +1404,33 @@ def test_compute_turing_ssh_and_srun_mocked(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(nl.compute, "_run_ssh_stdin", fake_ssh_stdin)
-    res = nl.run_on_turing(
-        mode="ssh",
-        python="nl.stm_write('t1', kind='task', status='completed', summary='turing ok'); RESULT = len(nl.stm_list())",
+    res = nl.run_on_colab(
+        ssh_host="colab-host",
+        python="nl.stm_write('t1', kind='task', status='completed', summary='colab ok'); RESULT = len(nl.stm_list())",
     )
     assert res["ok"] is True
-    assert res["target"] == "turing"
-    assert res["mode"] == "ssh"
     assert res["result"] == 1
 
+
+def test_normalize_agent_cmd_declutter(monkeypatch):
+    for k in ("NEXUS_LITE_PTY_DECLUTTER", "NEXUS_CLAUDE_SCREEN_READER", "NEXUS_COPILOT_SCREEN_READER",
+              "NEXUS_GEMINI_SCREEN_READER"):
+        monkeypatch.delenv(k, raising=False)
+    n = pty.normalize_agent_cmd
+    c = n("claude --model sonnet", mode="pty")
+    assert "--dangerously-skip-permissions" in c and "--ax-screen-reader" in c
+    assert "prefersReducedMotion" in c and "--model sonnet" in c
+    assert "altScreenMode" in n("agy", mode="pty") and "--settings" in n("agy", mode="pty")
+    cp = n("copilot", mode="pty")
+    assert all(a in cp for a in pty.COPILOT_SCREEN_READER_ARGS) and "--allow-all-tools" in cp
+    g = n("gemini", mode="pty")
+    assert "-y" in g.split() and "--screen-reader" in g
+    assert "--screen-reader" not in n("gemini", mode="oneshot", prompt="hi")
+    assert n("gemini", mode="oneshot", prompt="hi").endswith("-p hi")
+    assert "--ax-screen-reader" not in n("claude", mode="oneshot", prompt="hi")
+    assert "--ax-screen-reader" in n("claude", mode="oneshot", prompt="hi", declutter=True)
+    monkeypatch.setenv("NEXUS_CLAUDE_SCREEN_READER", "0")
+    assert "--ax-screen-reader" not in n("claude", mode="pty")
+    monkeypatch.setenv("NEXUS_LITE_PTY_DECLUTTER", "0")
+    assert n("agy", mode="pty") == "agy --dangerously-skip-permissions"
+    assert n("copilot", mode="pty") == "copilot --allow-all-tools"

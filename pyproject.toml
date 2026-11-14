@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-lite"
-version = "0.2.2"
+version = "0.3.0"
 description = "Ultra-simple Colab-ready multi-agent primitives for Nexus"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,6 +33,11 @@ Changelog = "https://github.com/choilab-jefferson/nexus.lite/blob/main/CHANGELOG
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+]
+mlflow = [
+    "mlflow-skinny>=2.10",
+    "sqlalchemy>=1.4",
+    "alembic>=1.8",
 ]
 demos = [
     "numpy>=1.24.0",

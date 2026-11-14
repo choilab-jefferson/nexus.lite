@@ -4,6 +4,7 @@ import io
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -80,5 +81,5 @@ def test_import_has_no_network():
             "u.urlopen = boom; socket.socket.connect = boom\n"
             "import nexus_lite.loom as l; l.LoomAdapter\n")
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                       env={**os.environ, "PYTHONPATH": os.getcwd()})
+                       env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)})
     assert r.returncode == 0, r.stderr

@@ -9,6 +9,8 @@ trycloudflare.com tunnel without firewall, port forwarding, or domain setup.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import hmac
 import http.server
 import json
@@ -18,6 +20,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +29,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import zlib
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -50,22 +55,115 @@ def redact_tunnel_info(info: Optional[dict]) -> Optional[dict]:
     return {k: v for k, v in info.items() if k != "token"}
 
 
-def token_file_path(port: int) -> Path:
-    """Local-only (never Drive) 0600 file holding the tunnel token for `port`."""
-    return Path(tempfile.gettempdir()) / f"nexus-lite-{os.getuid()}" / f"tunnel-{port}.token"
+def token_file_path(port_or_key: Union[int, str]) -> Path:
+    """Local-only (never Drive) 0600 token file: int port -> tunnel-<port>.token, str key -> <key>.token."""
+    name = f"tunnel-{port_or_key}.token" if isinstance(port_or_key, int) else f"{port_or_key}.token"
+    return Path(tempfile.gettempdir()) / f"nexus-lite-{os.getuid()}" / name
 
 
-def _write_token_file(port: int, token: str) -> Path:
+def _secure_token_dir(create: bool) -> Optional[Path]:
+    """The token dir, verified: a real directory (no symlink), owned by this uid, mode 0700.
+
+    The dir lives under the shared temp dir, so a pre-created symlink / foreign-owned dir must
+    never be trusted. Own dir with looser bits is tightened; anything else -> PermissionError.
+    `create=False` returns None when it does not exist.
+    """
+    d = token_file_path("x").parent
+    if create:
+        try:
+            os.mkdir(str(d), 0o700)
+        except FileExistsError:
+            pass
+    try:
+        st = os.lstat(str(d))
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError(f"token dir {d} is not a plain directory (symlink?)")
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"token dir {d} is not owned by uid {os.getuid()}")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(str(d), 0o700)
+        if stat.S_IMODE(os.lstat(str(d)).st_mode) != 0o700:
+            raise PermissionError(f"token dir {d} is not mode 0700")
+    return d
+
+
+def _write_token_file(port: Union[int, str], token: str) -> Path:
     path = token_file_path(port)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(token)
-    os.chmod(str(path), 0o600)
+    _secure_token_dir(create=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            f.write(token)
+    finally:
+        if fd >= 0:
+            os.close(fd)
     return path
 
 
-def _run_with_timeout(argv_or_cmd: Any, *, shell: bool, cwd: str, timeout: float) -> dict:
+def read_token_file(port_or_key: Union[int, str]) -> Optional[str]:
+    """Token stored by `_write_token_file`, or None when absent. Refuses a symlinked / foreign-owned /
+    group-or-world-accessible token file (opened O_NOFOLLOW; checks are on the open fd)."""
+    if _secure_token_dir(create=False) is None:
+        return None
+    try:
+        fd = os.open(str(token_file_path(port_or_key)), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:  # ELOOP from O_NOFOLLOW on a symlink
+        raise PermissionError(f"token file unreadable safely: {e}") from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+            raise PermissionError("token file is not a private regular file owned by this user")
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = -1
+            return f.read().strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def resolve_cli_token(token: Optional[str], token_file: Optional[str]) -> Optional[str]:
+    """CLI token precedence: --token-file, then deprecated --token (warns: visible in `ps`/history), then
+    $NEXUS_LITE_TOKEN. Returns None when none is given."""
+    if token_file:
+        val = Path(token_file).expanduser().read_text(encoding="utf-8").strip()
+        if not val:
+            raise ValueError(f"token file {token_file} is empty")
+        return val
+    if token is not None:
+        sys.stderr.write("warning: --token is deprecated (the value is visible in process listings and shell "
+                         "history); use --token-file PATH or the NEXUS_LITE_TOKEN env var\n")
+        return token
+    return (os.environ.get("NEXUS_LITE_TOKEN") or "").strip() or None
+
+
+FS_CHUNK_BYTES = 524288
+
+
+def _resolve_allowed_path(raw_path: str, server: Any) -> Path:
+    """Resolve `raw_path` and confine it to the workspace / workstation roots (else PermissionError)."""
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+        raise PermissionError("Path outside allowed workstation roots")
+    ws = core.get_workspace().resolve()
+    p = Path(raw_path)
+    target = (p if p.is_absolute() else ws / p).resolve()
+    roots = [ws, Path("/content/pc").resolve(), Path("/content/.nexus_runtime").resolve()]
+    extra = list(getattr(server, "allowed_roots", None) or [])
+    extra += [x for x in os.environ.get("NEXUS_LITE_PC_ROOT", "").split(os.pathsep) if x]
+    roots += [Path(x).resolve() for x in extra]
+    for r in roots:
+        if target == r or r in target.parents:
+            return target
+    raise PermissionError("Path outside allowed workstation roots")
+
+
+def _run_with_timeout(argv_or_cmd: Any, *, shell: bool, cwd: str, timeout: float,
+                      env: Optional[dict] = None) -> dict:
     """Run a command in its own process group; kill the whole group on timeout."""
     proc = subprocess.Popen(
         argv_or_cmd,
@@ -75,6 +173,7 @@ def _run_with_timeout(argv_or_cmd: Any, *, shell: bool, cwd: str, timeout: float
         stderr=subprocess.PIPE,
         text=True,
         cwd=cwd,
+        env=env,
         start_new_session=True,
     )
     try:
@@ -292,6 +391,24 @@ class TunnelRequestHandler(http.server.BaseHTTPRequestHandler):
                     exec_timeout = DEFAULT_EXEC_TIMEOUT
                 exec_timeout = max(0.1, min(exec_timeout, MAX_EXEC_TIMEOUT))
                 ws_cwd = str(core.get_workspace())
+                if payload.get("cwd"):
+                    try:
+                        rc_dir = _resolve_allowed_path(str(payload["cwd"]), self.server)
+                    except PermissionError as e:
+                        self._send_json(403, {"error": str(e)})
+                        return
+                    if payload.get("mkdir_cwd"):
+                        rc_dir.mkdir(parents=True, exist_ok=True)
+                    if not rc_dir.is_dir():
+                        self._send_json(400, {"error": "cwd is not a directory"})
+                        return
+                    ws_cwd = str(rc_dir)
+                extra: dict[str, Any] = {}
+                if isinstance(payload.get("env"), dict):
+                    run_env = os.environ.copy()
+                    run_env.update({k: v for k, v in payload["env"].items()
+                                    if isinstance(k, str) and isinstance(v, str)})
+                    extra["env"] = run_env
 
                 if "python" in payload and payload["python"] is not None:
                     py_src = str(payload["python"])
@@ -301,7 +418,7 @@ class TunnelRequestHandler(http.server.BaseHTTPRequestHandler):
                             tmp_py = tf.name
                         try:
                             res = _run_with_timeout(
-                                [sys.executable, tmp_py], shell=False, cwd=ws_cwd, timeout=exec_timeout
+                                [sys.executable, tmp_py], shell=False, cwd=ws_cwd, timeout=exec_timeout, **extra
                             )
                         finally:
                             try:
@@ -310,23 +427,30 @@ class TunnelRequestHandler(http.server.BaseHTTPRequestHandler):
                                 pass
                     else:
                         res = _run_with_timeout(
-                            [sys.executable, "-c", py_src], shell=False, cwd=ws_cwd, timeout=exec_timeout
+                            [sys.executable, "-c", py_src], shell=False, cwd=ws_cwd, timeout=exec_timeout, **extra
                         )
                     self._send_json(504 if res.get("timed_out") else 200, res)
                     return
 
                 if "cmd" in payload and payload["cmd"] is not None:
-                    res = _run_with_timeout(payload["cmd"], shell=True, cwd=ws_cwd, timeout=exec_timeout)
+                    res = _run_with_timeout(payload["cmd"], shell=True, cwd=ws_cwd, timeout=exec_timeout, **extra)
                     self._send_json(504 if res.get("timed_out") else 200, res)
                     return
 
                 self._send_json(400, {"error": "Missing 'cmd' or 'python' parameter in /exec"})
                 return
 
+            if path == "/fs":
+                self._handle_fs(payload)
+                return
+
             if path == "/pty":
                 action = payload.get("action")
                 if action == "spawn":
-                    name = pty.spawn(payload["cmd"], name=payload.get("name"), cwd=payload.get("cwd"))
+                    spawn_cwd = payload.get("cwd")
+                    if spawn_cwd:
+                        spawn_cwd = str(_resolve_allowed_path(str(spawn_cwd), self.server))
+                    name = pty.spawn(payload["cmd"], name=payload.get("name"), cwd=spawn_cwd)
                     self._send_json(200, {
                         "status": "ok",
                         "name": name,
@@ -556,8 +680,54 @@ class TunnelRequestHandler(http.server.BaseHTTPRequestHandler):
 
             self._send_json(404, {"error": f"Endpoint not found: {path}"})
 
+        except PermissionError as e:
+            self._send_json(403, {"error": str(e)})
         except Exception as e:
             self._send_json(500, {"error": str(e)})
+
+    def _handle_fs(self, payload: dict) -> None:
+        action = payload.get("action")
+        target = _resolve_allowed_path(str(payload.get("path") or ""), self.server)
+        if action == "write_chunk":
+            raw = zlib.decompress(base64.b64decode(payload["data_zb64"]))
+            offset = int(payload.get("offset", 0))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            mode = "wb" if (payload.get("truncate") and offset == 0) else ("r+b" if target.exists() else "wb")
+            with open(target, mode) as f:
+                f.seek(offset)
+                f.write(raw)
+            self._send_json(200, {"status": "ok", "path": str(target), "bytes_written": len(raw)})
+        elif action == "read_chunk":
+            if not target.is_file():
+                self._send_json(404, {"error": "File not found"})
+                return
+            offset = max(0, int(payload.get("offset", 0)))
+            length = max(0, min(int(payload.get("length", FS_CHUNK_BYTES)), FS_CHUNK_BYTES))
+            total = target.stat().st_size
+            with open(target, "rb") as f:
+                f.seek(offset)
+                chunk = f.read(length)
+            zb64 = base64.b64encode(zlib.compress(chunk)).decode("ascii")
+            self._send_json(200, {"status": "ok", "size": total, "offset": offset,
+                                  "bytes_read": len(chunk), "eof": offset + len(chunk) >= total,
+                                  "data_zb64": zb64})
+        elif action == "stat":
+            if not target.exists():
+                self._send_json(200, {"status": "ok", "exists": False, "is_file": False,
+                                      "size": 0, "sha256": None})
+                return
+            is_file = target.is_file()
+            digest = None
+            if is_file:
+                h = hashlib.sha256()
+                with open(target, "rb") as f:
+                    for blk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(blk)
+                digest = h.hexdigest()
+            self._send_json(200, {"status": "ok", "exists": True, "is_file": is_file,
+                                  "size": target.stat().st_size if is_file else 0, "sha256": digest})
+        else:
+            self._send_json(400, {"error": f"Unknown fs action: {action}"})
 
 
 class _ReusableThreadingHTTPServer(http.server.ThreadingHTTPServer):
@@ -843,20 +1013,77 @@ class ColabTunnelClient:
         """Query server health status and workspace path."""
         return self._request("GET", "/healthz")
 
-    def exec(self, cmd: Optional[str] = None, python: Optional[str] = None) -> dict:
-        """Run a remote shell command or Python snippet."""
+    def exec(self, cmd: Optional[str] = None, python: Optional[str] = None, *,
+             cwd: Optional[str] = None, env: Optional[dict] = None,
+             timeout: Optional[float] = None, mkdir_cwd: bool = False) -> dict:
+        """Run a remote shell command or Python snippet (optionally in a scoped cwd / extra env)."""
         payload: dict[str, Any] = {}
         if cmd is not None:
             payload["cmd"] = cmd
         if python is not None:
             payload["python"] = python
-        return self._request("POST", "/exec", payload)
+        if cwd is not None:
+            payload["cwd"] = str(cwd)
+            if mkdir_cwd:
+                payload["mkdir_cwd"] = True
+        if env:
+            payload["env"] = {str(k): str(v) for k, v in env.items()}
+        if timeout is not None:
+            payload["timeout"] = timeout
+        try:
+            return self._request("POST", "/exec", payload)
+        except urllib.error.HTTPError as e:
+            if e.code == 504:  # server-side exec timeout still carries a result body
+                return {"rc": None, "timed_out": True, "stdout": "", "stderr": "", "error": "exec timed out"}
+            raise
 
-    def pty_spawn(self, cmd: str, name: Optional[str] = None) -> str:
+    def fs_stat(self, path: str) -> dict:
+        return self._request("POST", "/fs", {"action": "stat", "path": str(path)})
+
+    def fs_write_bytes(self, remote_path: str, data: bytes, *, chunk_size: int = FS_CHUNK_BYTES) -> dict:
+        """Binary-safe chunked upload (zlib+base64 per chunk); returns size and sha256."""
+        chunk_size = max(1, min(int(chunk_size), FS_CHUNK_BYTES))
+        offset = 0
+        first = True
+        while first or offset < len(data):
+            chunk = data[offset: offset + chunk_size]
+            self._request("POST", "/fs", {
+                "action": "write_chunk", "path": str(remote_path), "offset": offset,
+                "truncate": first,
+                "data_zb64": base64.b64encode(zlib.compress(chunk)).decode("ascii"),
+            })
+            offset += len(chunk)
+            first = False
+        return {"path": str(remote_path), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+    def fs_read_bytes(self, remote_path: str, *, chunk_size: int = FS_CHUNK_BYTES) -> bytes:
+        chunk_size = max(1, min(int(chunk_size), FS_CHUNK_BYTES))
+        out = bytearray()
+        while True:
+            res = self._request("POST", "/fs", {"action": "read_chunk", "path": str(remote_path),
+                                                "offset": len(out), "length": chunk_size})
+            out += zlib.decompress(base64.b64decode(res["data_zb64"]))
+            if res["eof"] or not res["bytes_read"]:
+                return bytes(out)
+
+    def fs_upload(self, local_path: Union[str, Path], remote_path: str, *,
+                  chunk_size: int = FS_CHUNK_BYTES) -> dict:
+        return self.fs_write_bytes(remote_path, Path(local_path).read_bytes(), chunk_size=chunk_size)
+
+    def fs_download(self, remote_path: str, local_path: Union[str, Path], *,
+                    chunk_size: int = FS_CHUNK_BYTES) -> Path:
+        dest = Path(local_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(self.fs_read_bytes(remote_path, chunk_size=chunk_size))
+        return dest
+
+    def pty_spawn(self, cmd: str, name: Optional[str] = None, cwd: Optional[str] = None) -> str:
         """Spawn a remote dtach PTY session and return its name."""
         payload: dict[str, Any] = {"action": "spawn", "cmd": cmd}
         if name:
             payload["name"] = name
+        if cwd:
+            payload["cwd"] = str(cwd)
         res = self._request("POST", "/pty", payload)
         return res.get("name", name or "")
 
@@ -1169,6 +1396,345 @@ class ColabTunnelClient:
         return res if isinstance(res, str) else str(res)
 
 
+# ---- `colab` CLI backend (no cloudflared tunnel): sessions provisioned/driven via the installed `colab` binary ----
+COLAB_BIN_ENV = "NEXUS_COLAB_BIN"
+_SESSION_RE = re.compile(
+    r"^\[(?P<session>[^\]]+)\]\s+(?P<endpoint>\S+)\s*(?P<rest>.*)$")
+_EXEC_MARK = "__NEXUS_COLAB_EXEC__:"
+
+
+def _colab_gate() -> None:
+    from ..phi import phi_gate_error  # lazy: only the colab layer needs it
+
+    err = phi_gate_error("colab")
+    if err:
+        raise PermissionError(err)
+
+
+def _colab_bin() -> str:
+    exe = os.environ.get(COLAB_BIN_ENV) or shutil.which("colab")
+    if not exe:
+        raise FileNotFoundError("`colab` CLI not found on PATH (pip install colab-cli; or set NEXUS_COLAB_BIN)")
+    return exe
+
+
+def _tighten_colab_cli_perms() -> None:
+    """Best-effort: ~/.config/colab-cli dirs 0700, files (colab.log, history/*.jsonl, tokens) 0600."""
+    root = Path(os.path.expanduser("~/.config/colab-cli"))
+    try:
+        if not root.is_dir():
+            return
+        os.chmod(root, 0o700)
+        for dirpath, dirnames, filenames in os.walk(root):
+            for d in dirnames:
+                try:
+                    os.chmod(os.path.join(dirpath, d), 0o700)
+                except OSError:
+                    pass
+            for f in filenames:
+                try:
+                    os.chmod(os.path.join(dirpath, f), 0o600)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _colab_run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess:
+    _colab_gate()
+    _tighten_colab_cli_perms()
+    kw: dict[str, Any] = {}
+    if os.name == "posix":
+        kw["preexec_fn"] = lambda: os.umask(0o077)
+    try:
+        return subprocess.run([_colab_bin(), *args], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, **kw)
+    finally:
+        _tighten_colab_cli_perms()
+
+
+def _parse_colab_sessions(text: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for line in (text or "").splitlines():
+        m = _SESSION_RE.match(line.strip())
+        if not m:
+            continue
+        info: dict[str, Any] = {"session": m["session"], "endpoint": m["endpoint"]}
+        for part in m["rest"].split("|"):
+            k, _, v = part.partition(":")
+            if v and k.strip().lower() in ("hardware", "shape", "variant"):
+                info[k.strip().lower()] = v.strip()
+        out.append(info)
+    return out
+
+
+def colab_sessions(timeout: float = 60.0) -> list[dict[str, Any]]:
+    """`colab sessions` -> [{session, endpoint, hardware, shape, variant}]."""
+    p = _colab_run(["sessions"], timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError(f"colab sessions failed rc={p.returncode}: {(p.stderr or p.stdout)[-500:]}")
+    return _parse_colab_sessions(p.stdout)
+
+
+def colab_new(*, session: Optional[str] = None, gpu: Optional[str] = None, tpu: Optional[str] = None,
+              high_mem: bool = False, timeout: float = 300.0) -> dict[str, Any]:
+    """`colab new [-s S] [--gpu G] [--tpu T] [--high-mem]`; returns the created session's info."""
+    _colab_gate()
+    before = {s["session"] for s in colab_sessions()}
+    args = ["new"]
+    if session:
+        args += ["-s", session]
+    if gpu:
+        args += ["--gpu", gpu]
+    if tpu:
+        args += ["--tpu", tpu]
+    if high_mem:
+        args.append("--high-mem")
+    p = _colab_run(args, timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError(f"colab new failed rc={p.returncode}: {(p.stderr or p.stdout)[-500:]}")
+    after = colab_sessions()
+    created = [s for s in after if s["session"] == session or s["session"] not in before]
+    info = created[-1] if created else {"session": session}
+    if session and info.get("session") != session:
+        info = {**info, "name": session}
+    return info
+
+
+def colab_stop(session: str, timeout: float = 60.0) -> bool:
+    """`colab stop -s <session>`; True on success."""
+    return _colab_run(["stop", "-s", session], timeout=timeout).returncode == 0
+
+
+def colab_session_active(session: str) -> bool:
+    return any(session in (s["session"], s["endpoint"]) for s in colab_sessions())
+
+
+def colab_exec_file(session: str, local_py: Union[str, Path], *, timeout: float) -> subprocess.CompletedProcess:
+    """`colab exec -s S -f <file> --timeout T` (never `--env`: values leak into colab.log)."""
+    return _colab_run(["exec", "-s", session, "-f", str(local_py), "--timeout", f"{timeout:g}"],
+                      timeout=timeout + 60.0)
+
+
+_WRAPPER_SRC = '''\
+import json, os, subprocess, sys
+_sp = {spec_path!r}
+try:
+    with open(_sp, encoding="utf-8") as _f:
+        spec = json.load(_f)
+finally:
+    try:
+        os.unlink(_sp)
+    except OSError:
+        pass
+try:
+    env = dict(os.environ); env.update(spec["env"])
+    cwd = spec["cwd"]
+    if cwd:
+        if spec["mkdir_cwd"]:
+            os.makedirs(cwd, exist_ok=True)
+        os.chdir(cwd)
+    if spec["python"] is not None:
+        p = subprocess.run([sys.executable, "-c", spec["python"]], capture_output=True, text=True,
+                           env=env, timeout=spec["timeout"])
+    else:
+        p = subprocess.run(spec["cmd"], shell=True, capture_output=True, text=True, env=env,
+                           timeout=spec["timeout"])
+    res = {{"rc": p.returncode, "stdout": p.stdout, "stderr": p.stderr, "timed_out": False}}
+except subprocess.TimeoutExpired:
+    res = {{"rc": None, "stdout": "", "stderr": "", "timed_out": True, "error": "exec timed out"}}
+except BaseException as e:
+    res = {{"rc": 1, "stdout": "", "stderr": repr(e), "timed_out": False}}
+print("{mark}" + json.dumps(res))
+'''
+
+REMOTE_TMP_ENV = "NEXUS_COLAB_REMOTE_TMP"
+
+
+class ColabCliClient:
+    """Drop-in for ColabTunnelClient backed by `colab exec/upload/download` on a named Colab session."""
+
+    def __init__(self, session: str):
+        if not session or not isinstance(session, str):
+            raise ValueError("colab session name is required")
+        self.session = session
+        self.base_env: dict[str, str] = {}
+
+    @staticmethod
+    def _tmp_file(data: bytes, suffix: str) -> str:
+        fd, path = tempfile.mkstemp(prefix="nexus-colab-", suffix=suffix)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        except BaseException:
+            os.unlink(path)
+            raise
+        return path
+
+    def health(self) -> dict:
+        _colab_gate()
+        for s in colab_sessions():
+            if self.session in (s["session"], s["endpoint"]):
+                return {"status": "ok", "colab_session": self.session, **s}
+        raise RuntimeError(f"colab session {self.session!r} is not active")
+
+    def exec(self, cmd: Optional[str] = None, python: Optional[str] = None, *,
+             cwd: Optional[str] = None, env: Optional[dict] = None,
+             timeout: Optional[float] = None, mkdir_cwd: bool = False) -> dict:
+        if (cmd is None) == (python is None):
+            raise ValueError("exactly one of cmd / python is required")
+        t = float(timeout if timeout is not None else DEFAULT_EXEC_TIMEOUT)
+        merged = {**self.base_env, **{str(k): str(v) for k, v in (env or {}).items()}}
+        spec = {"env": merged, "cwd": cwd, "mkdir_cwd": bool(mkdir_cwd), "python": python, "cmd": cmd,
+                "timeout": t}
+        # spec (env/python/cmd) travels via `colab upload` (logs only the op, never contents); the
+        # `-f` wrapper holds just the remote path. Never `--env` / inline: colab-cli logs both verbatim.
+        local_spec = self._tmp_file(json.dumps(spec).encode("utf-8"), ".json")
+        remote_spec = None
+        try:
+            for d in (os.environ.get(REMOTE_TMP_ENV, "/dev/shm"), "/tmp"):
+                cand = f"{d.rstrip('/')}/nx-spec-{uuid.uuid4().hex}.json"
+                if _colab_run(["upload", "-s", self.session, local_spec, cand], timeout=60.0).returncode == 0:
+                    remote_spec = cand
+                    break
+        finally:
+            os.unlink(local_spec)
+        if remote_spec is None:
+            raise RuntimeError("colab upload of exec spec failed (refusing to inline env into colab exec -f)")
+        path = self._tmp_file(_WRAPPER_SRC.format(spec_path=remote_spec, mark=_EXEC_MARK).encode("utf-8"),
+                              ".py")
+        try:
+            try:
+                p = colab_exec_file(self.session, path, timeout=t + 15.0)
+            except subprocess.TimeoutExpired:
+                return {"rc": None, "timed_out": True, "stdout": "", "stderr": "", "error": "exec timed out"}
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        for ln in reversed((p.stdout or "").splitlines()):
+            if ln.startswith(_EXEC_MARK):
+                try:
+                    return json.loads(ln[len(_EXEC_MARK):])
+                except ValueError:
+                    break
+        return {"rc": p.returncode or 1, "stdout": p.stdout or "", "stderr": p.stderr or "",
+                "timed_out": False, "error": "no result marker from colab exec"}
+
+    def _py_json(self, code: str, *, timeout: float = 60.0) -> Any:
+        res = self.exec(python=code, timeout=timeout)
+        if res.get("rc") != 0:
+            raise RuntimeError(f"remote python failed rc={res.get('rc')}: {(res.get('stderr') or '')[-500:]}")
+        lines = [ln for ln in (res.get("stdout") or "").splitlines() if ln.strip()]
+        return json.loads(lines[-1]) if lines else None
+
+    def fs_stat(self, path: str) -> dict:
+        return self._py_json(
+            "import hashlib, json, os\n"
+            f"p = {str(path)!r}\n"
+            "ex = os.path.exists(p); isf = os.path.isfile(p)\n"
+            "print(json.dumps({'exists': ex, 'is_file': isf, 'size': os.path.getsize(p) if isf else 0,\n"
+            "                  'sha256': hashlib.sha256(open(p, 'rb').read()).hexdigest() if isf else None}))\n")
+
+    def fs_write_bytes(self, remote_path: str, data: bytes, *, chunk_size: int = FS_CHUNK_BYTES) -> dict:
+        local = self._tmp_file(data, ".bin")
+        try:
+            p = _colab_run(["upload", "-s", self.session, local, str(remote_path)], timeout=300.0)
+            ok = p.returncode == 0
+            if not ok:  # parent dir may be missing: mkdir once, retry
+                self._py_json(f"import os, json\nos.makedirs(os.path.dirname({str(remote_path)!r}) or '.', "
+                              "exist_ok=True)\nprint(json.dumps(1))\n")
+                ok = _colab_run(["upload", "-s", self.session, local, str(remote_path)],
+                                timeout=300.0).returncode == 0
+        finally:
+            os.unlink(local)
+        if not ok:  # fallback: chunked base64 through exec
+            chunk_size = max(1, min(int(chunk_size), 32768))
+            for i in range(0, max(len(data), 1), chunk_size):
+                b64 = base64.b64encode(data[i:i + chunk_size]).decode("ascii")
+                self._py_json(
+                    "import base64, json\n"
+                    f"open({str(remote_path)!r}, {'wb' if i == 0 else 'ab'!r}).write(base64.b64decode({b64!r}))\n"
+                    "print(json.dumps(1))\n")
+        return {"path": str(remote_path), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+    def fs_read_bytes(self, remote_path: str, *, chunk_size: int = FS_CHUNK_BYTES) -> bytes:
+        fd, local = tempfile.mkstemp(prefix="nexus-colab-dl-")
+        os.close(fd)
+        try:
+            p = _colab_run(["download", "-s", self.session, str(remote_path), local], timeout=300.0)
+            if p.returncode == 0:
+                return Path(local).read_bytes()
+        finally:
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
+        out = bytearray()  # fallback: base64 read through exec
+        step = 32768
+        while True:
+            res = self._py_json(
+                "import base64, json\n"
+                f"f = open({str(remote_path)!r}, 'rb'); f.seek({len(out)}); d = f.read({step})\n"
+                "print(json.dumps({'b': base64.b64encode(d).decode(), 'n': len(d)}))\n")
+            out += base64.b64decode(res["b"])
+            if res["n"] < step:
+                return bytes(out)
+
+    def fs_upload(self, local_path: Union[str, Path], remote_path: str, **kw: Any) -> dict:
+        return self.fs_write_bytes(remote_path, Path(local_path).read_bytes(), **kw)
+
+    def fs_download(self, remote_path: str, local_path: Union[str, Path], **kw: Any) -> Path:
+        dest = Path(local_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(self.fs_read_bytes(remote_path))
+        return dest
+
+    # ---- PTY: nexus_lite.pty inside the remote session (mirrors TunnelRequestHandler /pty) ----
+    def _pty(self, call: str, *, timeout: float = 60.0) -> Any:
+        return self._py_json(
+            "import json\nfrom nexus_lite import pty\n"
+            f"r = {call}\nprint(json.dumps(r if isinstance(r, (str, list, dict, type(None))) else True))\n",
+            timeout=timeout)
+
+    def pty_spawn(self, cmd: str, name: Optional[str] = None, cwd: Optional[str] = None) -> str:
+        return self._pty(f"pty.spawn({cmd!r}, name={name!r}, cwd={cwd!r})") or (name or "")
+
+    def pty_send(self, name: str, text: str, enter: bool = True) -> None:
+        self._pty(f"pty.send({name!r}, {text!r}, enter={enter!r})")
+
+    def pty_keys(self, name: str, *tokens: str) -> None:
+        self._pty(f"pty.keys({name!r}, *{list(tokens)!r})")
+
+    def pty_read(self, name: str, cols: int = 160, rows: int = 45, settle: float = 0.25) -> str:
+        return self._pty(f"pty.read({name!r}, cols={cols!r}, rows={rows!r}, settle={settle!r})") or ""
+
+    def pty_wait(self, name: str, provider: str = "", timeout: float = 30.0) -> str:
+        return self._pty(f"pty.wait({name!r}, provider={provider!r}, timeout={timeout!r})",
+                         timeout=timeout + 30.0) or ""
+
+    def pty_list(self) -> list[dict]:
+        return self._pty("pty.list_sessions()") or []
+
+    def pty_kill(self, name: str) -> None:
+        self._pty(f"pty.kill({name!r})")
+
+
+def _colab_cli_main(fn: Any) -> int:
+    """Run a `colab` CLI helper; JSON on stdout, errors on stderr (PHI -> 78)."""
+    try:
+        print(json.dumps(fn(), default=repr))
+        return 0
+    except PermissionError as e:
+        print(json.dumps({"ok": False, "error": str(e), "code": 78}), file=sys.stderr)
+        return 78
+    except Exception as e:  # noqa: BLE001 - CLI boundary
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}), file=sys.stderr)
+        return 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """CLI entrypoint for nexus-lite-colab / python -m nexus_lite.colab.tunnel."""
     parser = argparse.ArgumentParser(
@@ -1180,18 +1746,79 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_start = sub.add_parser("start", help="Start HTTP tunnel server (loopback; tunnel only with --tunnel --token)")
     p_start.add_argument("--port", "-p", type=int, default=8765, help="Port to listen on (default: 8765)")
     p_start.add_argument("--tunnel", action="store_true", help="Publish a public trycloudflare tunnel (requires --token)")
-    p_start.add_argument("--token", "-t", default=None, help="Bearer token (random if omitted; required with --tunnel)")
+    p_start.add_argument("--token", "-t", default=None,
+                         help="DEPRECATED (visible in ps/history): use --token-file or $NEXUS_LITE_TOKEN")
+    p_start.add_argument("--token-file", default=None, help="Read the Bearer token from this file")
     p_start.add_argument("--show-token", action="store_true", help="Print the bearer token to stdout")
 
-    sub.add_parser("stop", help="Stop running tunnel server and cloudflared session")
+    p_stop = sub.add_parser("stop", help="Stop the local tunnel (or, with --session, a `colab` CLI session)")
+    p_stop.add_argument("--session", "-s", default=None, help="Colab CLI session to stop via `colab stop`")
     sub.add_parser("status", help="Show tunnel server status")
 
     p_exec = sub.add_parser("exec", help="Execute remote command on tunnel server")
     p_exec.add_argument("cmd", help="Shell command to execute remotely")
-    p_exec.add_argument("--url", "-u", required=True, help="Remote tunnel URL")
-    p_exec.add_argument("--token", "-t", required=True, help="Authentication Bearer token")
+    p_exec.add_argument("--url", "-u", default=None, help="Remote tunnel URL")
+    p_exec.add_argument("--token", "-t", default=None,
+                        help="DEPRECATED (visible in ps/history): use --token-file or $NEXUS_LITE_TOKEN")
+    p_exec.add_argument("--token-file", default=None, help="Read the Bearer token from this file")
+    p_exec.add_argument("--session", "-s", default=None, help="Colab CLI session (instead of --url/--token)")
+
+    p_new = sub.add_parser("new", help="Create a Colab CLI session (`colab new`)")
+    p_new.add_argument("--session", "-s", default=None)
+    p_new.add_argument("--gpu", default=None)
+    p_new.add_argument("--tpu", default=None)
+    p_new.add_argument("--high-mem", action="store_true")
+    sub.add_parser("sessions", aliases=["ls"], help="List active Colab CLI sessions (`colab sessions`)")
+
+    p_pc = sub.add_parser("pc", help="Agent PC: dedicated per-agent Colab workstation (World <-> PC)")
+    pcs = p_pc.add_subparsers(dest="pc_action", required=True)
+    a = pcs.add_parser("bind"); a.add_argument("agent"); a.add_argument("--url", default=None)
+    a.add_argument("--token", default=None, help="DEPRECATED: use --token-file or $NEXUS_LITE_TOKEN")
+    a.add_argument("--token-file", default=None); a.add_argument("--gpu", default=None)
+    a.add_argument("--session", "-s", dest="colab_session", default=None,
+                   help="Colab CLI session name (auto-created via `colab new` if not active)")
+    a.add_argument("--tpu", default=None); a.add_argument("--high-mem", action="store_true")
+    a.add_argument("--remote-home", default=None); a.add_argument("--no-bootstrap", action="store_true")
+    pcs.add_parser("ls")
+    a = pcs.add_parser("status"); a.add_argument("agent")
+    a = pcs.add_parser("unbind"); a.add_argument("agent"); a.add_argument("--stop-remote", action="store_true")
+    a = pcs.add_parser("checkout"); a.add_argument("agent")
+    a.add_argument("--stm", action=argparse.BooleanOptionalAction, default=True)
+    a.add_argument("--bus", action=argparse.BooleanOptionalAction, default=True)
+    a.add_argument("--wiki", action="append"); a.add_argument("--file", action="append",
+                                                               help="<remote_rel>=<local_path>")
+    a = pcs.add_parser("run"); a.add_argument("agent"); a.add_argument("--python", default=None)
+    a.add_argument("--cmd", default=None); a.add_argument("--bg", action="store_true")
+    a.add_argument("--job-id", default=None); a.add_argument("--collect", action="append")
+    a.add_argument("--timeout", type=float, default=300.0)
+    a.add_argument("--lite", nargs=argparse.REMAINDER, default=None, help="nexus_lite argv (must be last)")
+    a = pcs.add_parser("poll"); a.add_argument("agent"); a.add_argument("job_id")
+    a.add_argument("--wait", action="store_true"); a.add_argument("--timeout", type=float, default=300.0)
+    a = pcs.add_parser("pty"); a.add_argument("agent")
+    pty_sub = a.add_subparsers(dest="pty_action", required=True)
+    b = pty_sub.add_parser("new"); b.add_argument("cmd"); b.add_argument("--name", default="shell")
+    b = pty_sub.add_parser("send"); b.add_argument("name"); b.add_argument("text")
+    b = pty_sub.add_parser("keys"); b.add_argument("name"); b.add_argument("tokens", nargs="+")
+    b = pty_sub.add_parser("read"); b.add_argument("name")
+    pty_sub.add_parser("list")
+    b = pty_sub.add_parser("kill"); b.add_argument("name")
+    a = pcs.add_parser("publish"); a.add_argument("agent"); a.add_argument("--summary", required=True)
+    a.add_argument("--artifact", action="append"); a.add_argument("--wiki", action="append")
+    a.add_argument("--notify", default="ALL"); a.add_argument("--task-id", default=None)
 
     args = parser.parse_args(argv)
+
+    if hasattr(args, "token_file"):
+        try:
+            args.token = resolve_cli_token(args.token, args.token_file)
+        except (OSError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+
+    if args.subcommand == "pc":
+        from . import pc as _pc  # lazy: pc imports this module
+
+        return _pc.cli(args)
 
     if not args.subcommand:
         parser.print_help()
@@ -1217,9 +1844,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     elif args.subcommand == "stop":
+        if args.session:
+            return _colab_cli_main(lambda: {"ok": True, "session": args.session,
+                                            "stopped": colab_stop(args.session)})
         stop_tunnel()
         print("Tunnel stopped.")
         return 0
+
+    elif args.subcommand == "new":
+        return _colab_cli_main(lambda: {"ok": True, **colab_new(
+            session=args.session, gpu=args.gpu, tpu=args.tpu, high_mem=args.high_mem)})
+
+    elif args.subcommand in ("sessions", "ls"):
+        return _colab_cli_main(lambda: {"ok": True, "sessions": colab_sessions()})
 
     elif args.subcommand == "status":
         info = get_tunnel_info()
@@ -1230,13 +1867,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     elif args.subcommand == "exec":
-        client = ColabTunnelClient(args.url, args.token)
-        res = client.exec(cmd=args.cmd)
+        if args.session:
+            try:
+                res = ColabCliClient(args.session).exec(cmd=args.cmd)
+            except PermissionError as e:
+                print(json.dumps({"ok": False, "error": str(e), "code": 78}), file=sys.stderr)
+                return 78
+        elif args.url and args.token:
+            res = ColabTunnelClient(args.url, args.token).exec(cmd=args.cmd)
+        else:
+            print("colab exec needs --session or both --url and --token", file=sys.stderr)
+            return 2
         if res.get("stdout"):
             sys.stdout.write(res["stdout"])
         if res.get("stderr"):
             sys.stderr.write(res["stderr"])
-        return res.get("rc", 0)
+        return res.get("rc") or 0
 
     return 0
 

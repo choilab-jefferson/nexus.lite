@@ -32,7 +32,7 @@ MIN_LOOM_VERSION = "0.1.0"
 _ENV_ALLOW = frozenset({
     "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR",
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
-    "OPENROUTER_API_KEY", "OLLAMA_HOST",
+    "OPENROUTER_API_KEY", "OLLAMA_HOST", "OPENAI_BASE_URL",
 })
 
 
@@ -228,7 +228,7 @@ class LoomAdapter:
         try:
             p = subprocess.run(
                 [path, *args], capture_output=True, text=True,
-                timeout=self.timeout, env=loom_env(self.env_passthrough),
+                stdin=subprocess.DEVNULL, timeout=self.timeout, env=loom_env(self.env_passthrough),
             )
         except subprocess.TimeoutExpired as e:
             out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -280,3 +280,87 @@ class LoomAdapter:
         """Run `loom -p <instruction>`."""
         flags = self._flags(provider, model, workspace, max_turns, trace_path, extra_args)
         return self._exec(["-p", instruction, *flags], trace_path)
+
+
+def _max_steps_default() -> int:
+    try:
+        return max(1, int(os.environ.get("NEXUS_MAX_STEPS", "10")))
+    except ValueError:
+        return 10
+
+
+@dataclass
+class StepRecord:
+    step: int
+    status: str
+    verified: bool
+    goal: str
+    output: str = ""
+
+
+class LoomStateLoop:
+    """Bounded iterate-until-verified loop around LoomAdapter.
+
+    Each step writes an append-only context file for `loom --context-in`
+    (blocks 1-3 never change between steps, so prefix caches stay hot), runs
+    loom, reads `--context-out`, calls `verify(result) -> bool`, and checkpoints
+    step metadata to lite.db. Stops on verify success, a non-retryable status,
+    or `max_steps` (default NEXUS_MAX_STEPS, else 10).
+    """
+
+    def __init__(self, adapter: Optional[LoomAdapter] = None, *, run_id: str,
+                 system: str = "", pack: str = "", max_steps: Optional[int] = None,
+                 max_context_chars: int = 24000, checkpoint: bool = True):
+        self.adapter = adapter or LoomAdapter()
+        self.run_id = run_id
+        self.system = system
+        self.pack = pack
+        self.max_steps = max_steps if max_steps is not None else _max_steps_default()
+        self.max_context_chars = max_context_chars
+        self.checkpoint = checkpoint
+        self.ledger: List[str] = []
+        self.records: List[StepRecord] = []
+
+    def render_context(self, goal: str, verifier_output: str = "") -> str:
+        """Frozen system, frozen pack, append-only ledger, then current goal."""
+        head = f"[Frozen Role / System Spec]\n{self.system}\n\n[Frozen IKB Context Pack]\n{self.pack}\n\n"
+        tail = f"\n[Current Step Goal & Verifier Output]\n{goal}\n{verifier_output}\n"
+        ledger = list(self.ledger)
+        budget = self.max_context_chars - len(head) - len(tail)
+        # Bound size by dropping the oldest entries; the surviving prefix stays stable
+        # once the ledger is at the cap (older steps are elided, never rewritten).
+        while ledger and sum(len(e) + 1 for e in ledger) > budget:
+            ledger.pop(0)
+        return head + "[Append-Only Step Ledger]\n" + "\n".join(ledger) + tail
+
+    def _save(self, rec: StepRecord) -> None:
+        from . import _db
+        with _db.connect() as con:
+            con.execute("CREATE TABLE IF NOT EXISTS loom_state_steps ("
+                        "run_id TEXT, step INTEGER, status TEXT, verified INTEGER, goal TEXT, "
+                        "ts REAL DEFAULT (strftime('%s','now')), PRIMARY KEY (run_id, step))")
+            con.execute("INSERT OR REPLACE INTO loom_state_steps (run_id, step, status, verified, goal) "
+                        "VALUES (?,?,?,?,?)", (self.run_id, rec.step, rec.status, int(rec.verified), rec.goal))
+
+    def run(self, goal: str, verify, **run_kwargs) -> List[StepRecord]:
+        verifier_output = ""
+        extra = list(run_kwargs.pop("extra_args", None) or [])
+        with tempfile.TemporaryDirectory() as d:
+            for n in range(1, self.max_steps + 1):
+                cin, cout = os.path.join(d, "ctx-in.txt"), os.path.join(d, "ctx-out.txt")
+                if os.path.exists(cout):
+                    os.remove(cout)  # never reuse a previous step's output
+                Path(cin).write_text(self.render_context(goal, verifier_output), encoding="utf-8")
+                res = self.adapter.run_prompt(
+                    goal, extra_args=extra + ["--context-in", cin, "--context-out", cout], **run_kwargs)
+                out = Path(cout).read_text(encoding="utf-8", errors="replace") if os.path.exists(cout) else ""
+                verified = bool(res.ok and verify(res))
+                rec = StepRecord(n, res.status, verified, goal, out)
+                self.records.append(rec)
+                self.ledger.append(f"step {n}: status={res.status} verified={verified} out={out.strip()[:500]}")
+                if self.checkpoint:
+                    self._save(rec)
+                if verified or not (res.ok or res.retryable):
+                    break
+                verifier_output = f"previous step {n} not verified (status={res.status})"
+        return self.records

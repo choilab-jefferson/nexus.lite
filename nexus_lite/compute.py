@@ -1,5 +1,5 @@
 """
-nexus_lite.compute — Zero-preinstall remote compute dispatch for Turing HPC (internal) and Google Colab (external).
+nexus_lite.compute — Zero-preinstall remote compute dispatch for Google Colab and local sandboxes.
 
 Core philosophy ("Ship `lite` and compute"):
 - Packs the local `nexus_lite` stdlib-only source tree into a compact in-memory ZIP (~140 KB).
@@ -8,13 +8,10 @@ Core philosophy ("Ship `lite` and compute"):
   initializes an isolated `.nexus` workspace, and runs Python code, shell commands, or
   `nexus-lite` CLI workflows—even on bare machines where `nexus` or `nexus-lite` was never installed.
 - Supports:
-  1. `turing` / `hpc` (Internal SLURM HPC): SSH to `NEXUS_TURING_HOST` / `NEXUS_HPC_HOST` (default SSH alias
-     `turing`, with optional jump-host fallback via `NEXUS_TURING_JUMP_HOST` / `NEXUS_HPC_JUMP_HOST`) and
-     execution via `srun` (compute/GPU node), `sbatch` (batch job), or `ssh` (login node).
-  2. `colab` (External Compute): Execution via HTTP tunnel (`POST /exec` with self-extracting
+  1. `colab`: Execution via HTTP tunnel (`POST /exec` with self-extracting
      `nexus_lite` bundle), SSH tunnel, or standalone self-bootstrapping script generation for
      bare Colab notebooks / Google Drive.
-  3. `local` (Local Sandbox): Unpacks the bundle into a clean temporary directory and executes
+  2. `local` (Local Sandbox): Unpacks the bundle into a clean temporary directory and executes
      without touching the caller's installed packages.
 """
 
@@ -29,7 +26,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -39,14 +35,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 RESULT_MARKER = "__NEXUS_LITE_COMPUTE_JSON__:"
-DEFAULT_TURING_HOST = "turing"
-DEFAULT_TURING_JUMP_HOST = ""
 
 # Non-kernel content, shipped only with include_extras: the whole `demos/` package
 # plus the deprecated top-level shim modules that forward into it. The remote runner
 # (and nexus_lite.colab, which only lazy-imports demos.viz) never needs them.
+# `tracking.py` (optional MLflow adapter) is likewise host-side only.
 _OPTIONAL_EXTRA_DIRS = {"demos"}
-_OPTIONAL_EXTRA_FILES = {"viz.py", "loom_multi_agent.py", "loom_multi_task.py", "loom_radiomics_tasks.py"}
+_OPTIONAL_EXTRA_FILES = {"viz.py", "loom_multi_agent.py", "loom_multi_task.py", "loom_radiomics_tasks.py", "tracking.py"}
 
 
 def pack_lite_bundle(include_extras: bool = True) -> tuple[bytes, str]:
@@ -286,8 +281,6 @@ def main() -> int:
         "job_id": job_id,
         "bundle_sha": bundle_sha,
         "hostname": socket.gethostname(),
-        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-        "slurm_nodelist": os.environ.get("SLURM_JOB_NODELIST") or os.environ.get("SLURMD_NODENAME"),
         "python_version": platform.python_version(),
         "lite_version": getattr(nexus_lite, "__version__", "unknown"),
         "runtime_dir": str(runtime_dir),
@@ -344,221 +337,10 @@ def _run_ssh_stdin(
     remote_cmd: list[str],
     stdin_text: str,
     timeout: float = 300.0,
-    jump_host: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
-    """Run a remote command over SSH, with automatic fallback via `jump_host` if direct SSH fails (rc 255)."""
-    base_ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
-    direct_argv = [*base_ssh, host, *remote_cmd]
-    proc = subprocess.run(
-        direct_argv,
-        input=stdin_text,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-    )
-    if proc.returncode == 255 and jump_host and jump_host != host:
-        inner = " ".join(shlex.quote(x) for x in ["ssh", "-o", "BatchMode=yes", host, *remote_cmd])
-        jump_argv = [*base_ssh, jump_host, inner]
-        return subprocess.run(
-            jump_argv,
-            input=stdin_text,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
-    return proc
-
-
-def run_on_turing(
-    *,
-    python: Optional[str] = None,
-    cmd: Optional[str] = None,
-    lite_argv: Optional[list[str]] = None,
-    files: Optional[dict[str, str]] = None,
-    collect_files: Optional[list[str]] = None,
-    mode: str = "srun",
-    partition: str = "batch",
-    gres: Optional[str] = None,
-    cpus: int = 2,
-    mem: Optional[str] = None,
-    time_limit: str = "00:10:00",
-    ssh_host: Optional[str] = None,
-    jump_host: Optional[str] = None,
-    remote_python: str = "python3",
-    job_id: Optional[str] = None,
-    include_extras: bool = True,
-    timeout: float = 300.0,
-) -> dict[str, Any]:
-    """Ship `nexus_lite` to an SSH / SLURM HPC cluster and execute a computation.
-
-    Modes:
-    - `mode="srun"` (default): Stages `nexus_lite` onto shared NFS (`~/.cache/nexus_lite`) on the login
-      node, then executes the runner on a SLURM compute node via `srun`.
-    - `mode="ssh"`: Runs directly on the SSH login node without SLURM allocation.
-    - `mode="sbatch"`: Stages `nexus_lite` and submits a non-blocking SLURM batch job via `sbatch`,
-      returning `slurm_job_id` and `job_dir`.
-    """
-    if mode not in ("srun", "ssh", "sbatch"):
-        raise ValueError(f"Unsupported Turing mode {mode!r}; expected 'srun', 'ssh', or 'sbatch'")
-
-    host = ssh_host or os.environ.get("NEXUS_TURING_HOST") or os.environ.get("NEXUS_HPC_HOST") or DEFAULT_TURING_HOST
-    jhost = (
-        jump_host
-        if jump_host is not None
-        else (os.environ.get("NEXUS_TURING_JUMP_HOST") or os.environ.get("NEXUS_HPC_JUMP_HOST") or DEFAULT_TURING_JUMP_HOST)
-    )
-
-    runner_src, bundle_sha, resolved_job_id = pack_self_contained_script(
-        python=python,
-        cmd=cmd,
-        lite_argv=lite_argv,
-        files=files,
-        collect_files=collect_files,
-        job_id=job_id,
-        target="turing",
-        mode=mode,
-        include_extras=include_extras,
-    )
-
-    if mode == "ssh":
-        proc = _run_ssh_stdin(host, [remote_python, "-"], runner_src, timeout=timeout, jump_host=jhost)
-        res = parse_runner_output(proc.stdout, proc.stderr, proc.returncode)
-        res.setdefault("target", "turing")
-        res.setdefault("mode", "ssh")
-        return res
-
-    # For srun and sbatch, stage runner.py onto shared NFS (~/.cache/nexus_lite/jobs/<job_id>/runner.py)
-    # on the login node, then invoke srun or sbatch.
-    runner_b64 = base64.b64encode(runner_src.encode("utf-8")).decode("ascii")
-    slurm_opts = {
-        "mode": mode,
-        "job_id": resolved_job_id,
-        "bundle_sha": bundle_sha,
-        "partition": partition,
-        "gres": gres,
-        "cpus": int(cpus),
-        "mem": mem,
-        "time_limit": time_limit,
-        "remote_python": remote_python,
-        "runner_b64": runner_b64,
-    }
-    stage_script = f"""
-import base64, json, os, shlex, subprocess, sys
-from pathlib import Path
-
-opts = json.loads({json.dumps(slurm_opts)!r})
-job_dir = (Path.home() / ".cache" / "nexus_lite" / "jobs" / opts["job_id"]).resolve()
-job_dir.mkdir(parents=True, exist_ok=True)
-runner_path = job_dir / "runner.py"
-runner_path.write_bytes(base64.b64decode(opts["runner_b64"]))
-runner_path.chmod(0o755)
-
-if opts["mode"] == "srun":
-    cmd = [
-        "srun",
-        f"--job-name={{opts['job_id']}}",
-        f"--partition={{opts['partition']}}",
-        "--ntasks=1",
-        f"--cpus-per-task={{opts['cpus']}}",
-        f"--time={{opts['time_limit']}}",
-    ]
-    if opts.get("gres"):
-        cmd.append(f"--gres={{opts['gres']}}")
-    if opts.get("mem"):
-        cmd.append(f"--mem={{opts['mem']}}")
-    cmd += [opts["remote_python"], str(runner_path)]
-    proc = subprocess.run(cmd, cwd=str(job_dir), text=True, capture_output=True)
-    sys.stdout.write(proc.stdout or "")
-    sys.stderr.write(proc.stderr or "")
-    raise SystemExit(proc.returncode)
-else:
-    lines = [
-        "#!/bin/bash",
-        f"#SBATCH --job-name={{opts['job_id']}}",
-        f"#SBATCH --partition={{opts['partition']}}",
-        "#SBATCH --ntasks=1",
-        f"#SBATCH --cpus-per-task={{opts['cpus']}}",
-        f"#SBATCH --time={{opts['time_limit']}}",
-        f"#SBATCH --output={{job_dir / 'slurm.out'}}",
-        f"#SBATCH --error={{job_dir / 'slurm.err'}}",
-    ]
-    if opts.get("gres"):
-        lines.append(f"#SBATCH --gres={{opts['gres']}}")
-    if opts.get("mem"):
-        lines.append(f"#SBATCH --mem={{opts['mem']}}")
-    lines.append(f"exec {{shlex.quote(opts['remote_python'])}} {{shlex.quote(str(runner_path))}}")
-    sbatch_path = job_dir / "job.sbatch"
-    sbatch_path.write_text("\\n".join(lines) + "\\n", encoding="utf-8")
-    proc = subprocess.run(["sbatch", "--parsable", str(sbatch_path)], cwd=str(job_dir), text=True, capture_output=True)
-    slurm_id = (proc.stdout or "").strip().split(";")[0]
-    payload = {{
-        "ok": proc.returncode == 0 and bool(slurm_id),
-        "status": "submitted" if proc.returncode == 0 else "failed",
-        "target": "turing",
-        "mode": "sbatch",
-        "job_id": opts["job_id"],
-        "bundle_sha": opts["bundle_sha"],
-        "slurm_job_id": slurm_id or None,
-        "job_dir": str(job_dir),
-        "rc": proc.returncode,
-        "stdout": proc.stdout or "",
-        "stderr": proc.stderr or "",
-    }}
-    sys.stdout.write("\\n" + {RESULT_MARKER!r} + json.dumps(payload) + "\\n")
-    raise SystemExit(proc.returncode)
-"""
-    proc = _run_ssh_stdin(host, [remote_python, "-"], stage_script, timeout=timeout, jump_host=jhost)
-    return parse_runner_output(proc.stdout, proc.stderr, proc.returncode)
-
-
-def turing_job_status(
-    job_id: str,
-    *,
-    slurm_job_id: Optional[str] = None,
-    ssh_host: Optional[str] = None,
-    jump_host: Optional[str] = None,
-    remote_python: str = "python3",
-    timeout: float = 30.0,
-) -> dict[str, Any]:
-    """Query the status and result of a `mode="sbatch"` job on an SSH / SLURM HPC cluster."""
-    host = ssh_host or os.environ.get("NEXUS_TURING_HOST") or os.environ.get("NEXUS_HPC_HOST") or DEFAULT_TURING_HOST
-    jhost = (
-        jump_host
-        if jump_host is not None
-        else (os.environ.get("NEXUS_TURING_JUMP_HOST") or os.environ.get("NEXUS_HPC_JUMP_HOST") or DEFAULT_TURING_JUMP_HOST)
-    )
-    probe = f"""
-import json, subprocess, sys
-from pathlib import Path
-
-job_id = {job_id!r}
-slurm_id = {slurm_job_id!r}
-job_dir = (Path.home() / ".cache" / "nexus_lite" / "jobs" / job_id).resolve()
-res_file = job_dir / "result.json"
-if res_file.is_file():
-    data = json.loads(res_file.read_text(encoding="utf-8"))
-    sys.stdout.write("\\n" + {RESULT_MARKER!r} + json.dumps(data) + "\\n")
-    raise SystemExit(0)
-
-state = "unknown"
-if slurm_id:
-    sq = subprocess.run(["squeue", "-h", "-j", str(slurm_id), "-o", "%T"], text=True, capture_output=True)
-    state = (sq.stdout or "").strip() or "finished_or_not_in_queue"
-payload = {{
-    "ok": True,
-    "status": state.lower(),
-    "target": "turing",
-    "mode": "sbatch",
-    "job_id": job_id,
-    "slurm_job_id": slurm_id,
-    "job_dir": str(job_dir),
-    "stdout": (job_dir / "slurm.out").read_text(encoding="utf-8", errors="replace") if (job_dir / "slurm.out").is_file() else "",
-    "stderr": (job_dir / "slurm.err").read_text(encoding="utf-8", errors="replace") if (job_dir / "slurm.err").is_file() else "",
-}}
-sys.stdout.write("\\n" + {RESULT_MARKER!r} + json.dumps(payload) + "\\n")
-"""
-    proc = _run_ssh_stdin(host, [remote_python, "-"], probe, timeout=timeout, jump_host=jhost)
-    return parse_runner_output(proc.stdout, proc.stderr, proc.returncode)
+    """Run a remote command over SSH, feeding `stdin_text` on stdin."""
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, *remote_cmd]
+    return subprocess.run(argv, input=stdin_text, text=True, capture_output=True, timeout=timeout)
 
 
 def _discover_colab_tunnel() -> tuple[str, str]:
@@ -599,6 +381,7 @@ def run_on_colab(
     job_id: Optional[str] = None,
     include_extras: bool = True,
     timeout: float = 300.0,
+    colab_session: Optional[str] = None,
 ) -> dict[str, Any]:
     """Ship `nexus_lite` to an external Google Colab runtime and execute a computation.
 
@@ -618,7 +401,12 @@ def run_on_colab(
         resolved_token = token.strip()
     resolved_ssh = (ssh_host or os.environ.get("NEXUS_COLAB_SSH") or "").strip()
 
-    mode = "tunnel" if resolved_url else ("ssh" if resolved_ssh else "bootstrap")
+    session = (colab_session or "").strip() or None
+    if session and url:
+        raise ValueError("pass either url or colab_session, not both")
+    if session:
+        resolved_url = ""
+    mode = ("colab-cli" if session else "tunnel" if resolved_url else ("ssh" if resolved_ssh else "bootstrap"))
     runner_src, bundle_sha, resolved_job_id = pack_self_contained_script(
         python=python,
         cmd=cmd,
@@ -631,6 +419,25 @@ def run_on_colab(
         include_extras=include_extras,
         start_tunnel=start_tunnel,
     )
+
+    if session:
+        from nexus_lite.colab import tunnel as _tunnel  # lazy: kernel never imports colab
+
+        tmp_fd, tmp_runner = tempfile.mkstemp(prefix="nexus-colab-runner-", suffix=".py")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write(runner_src)
+            try:
+                proc = _tunnel.colab_exec_file(session, tmp_runner, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "status": "failed", "rc": 124, "stdout": "",
+                        "stderr": f"colab exec timed out after {timeout:g}s", "result": None, "artifacts": {}}
+        finally:
+            try:
+                os.unlink(tmp_runner)
+            except OSError:
+                pass
+        return parse_runner_output(proc.stdout, proc.stderr, proc.returncode)
 
     if bootstrap_out:
         out_path = Path(bootstrap_out).expanduser().resolve()
@@ -700,7 +507,7 @@ def run_on_colab(
         return parse_runner_output(out, err, rc)
 
     if resolved_ssh:
-        proc = _run_ssh_stdin(resolved_ssh, ["python3", "-"], runner_src, timeout=timeout, jump_host=None)
+        proc = _run_ssh_stdin(resolved_ssh, ["python3", "-"], runner_src, timeout=timeout)
         return parse_runner_output(proc.stdout, proc.stderr, proc.returncode)
 
     # Default fallback when no URL/SSH was given and bootstrap_out was not set:
@@ -762,7 +569,7 @@ def run_local_sandbox(
 
 
 def compute_run(
-    target: str = "turing",
+    target: str = "colab",
     *,
     python: Optional[str] = None,
     cmd: Optional[str] = None,
@@ -771,17 +578,8 @@ def compute_run(
     collect_files: Optional[list[str]] = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Unified dispatcher for `turing`/`hpc` (internal SLURM HPC), `colab` (external compute), or `local` (sandbox)."""
-    tgt = (target or "turing").strip().lower()
-    if tgt in ("turing", "hpc"):
-        return run_on_turing(
-            python=python,
-            cmd=cmd,
-            lite_argv=lite_argv,
-            files=files,
-            collect_files=collect_files,
-            **kwargs,
-        )
+    """Unified dispatcher for `colab` (external runtime) or `local` (sandbox)."""
+    tgt = (target or "colab").strip().lower()
     if tgt == "colab":
         return run_on_colab(
             python=python,
@@ -800,4 +598,4 @@ def compute_run(
             collect_files=collect_files,
             **kwargs,
         )
-    raise ValueError(f"Unknown compute target {target!r}; expected 'turing', 'hpc', 'colab', or 'local'")
+    raise ValueError(f"Unknown compute target {target!r}; expected 'colab' or 'local'")

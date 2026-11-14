@@ -208,3 +208,23 @@ def test_snapshot_forces_identity_over_local_env(tmp_path, monkeypatch):
 def test_script_info(capsys):
     assert ps.main(["script-info"]) == 0
     assert "SCRIPT_VERSION=" in capsys.readouterr().out
+
+
+def test_leak_allow_exempts_listed_path_only(tmp_path):
+    d = tmp_path / "x"; d.mkdir()
+    (d / "docs").mkdir()
+    (d / "docs/a.md").write_text("url = '" + HOST + "'\n")
+    (d / "b.md").write_text("url = '" + HOST + "'\n")
+    cfg = {"leak_allow": {"internal-host": ["docs/a.md"]}}
+    hits = ps.leak_check(d, cfg)
+    assert "docs/a.md:1:internal-host" not in hits
+    assert "b.md:1:internal-host" in hits
+    assert "docs/a.md:1:internal-host" in ps.leak_check(d)
+
+
+def test_config_deny_excludes_inside_allowlisted_dir(tmp_path):
+    r = _repo(tmp_path, {"nexus_lite/secret.py": "x = 1\n"})
+    d = tmp_path / "out"
+    ps.export("HEAD", d, {**CFG, "deny": ["nexus_lite/secret.py"]}, repo=str(r))
+    got = {p.relative_to(d).as_posix() for p in d.rglob("*") if p.is_file()}
+    assert "nexus_lite/a.py" in got and "nexus_lite/secret.py" not in got

@@ -37,6 +37,47 @@ TASK_DIR_ENV_DEPRECATED = "NEXUS_ARTIFACT_DIR"
 PathLike = Union[str, "os.PathLike[str]"]
 
 
+def mkdir_private(path: PathLike) -> Path:
+    """Create `path` (and parents) and force the leaf to 0700. Best-effort chmod: a dir we do not own is left alone."""
+    p = Path(path)
+    p.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(str(p), 0o700)
+    except OSError:
+        pass
+    return p
+
+
+def write_private(path: PathLike, data: Union[str, bytes], *, append: bool = False) -> Path:
+    """Write `data` to `path` as a 0600 file (created 0600, tightened if it already existed)."""
+    p = Path(path)
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(p), flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "ab" if append else "wb") as f:
+            fd = -1
+            f.write(data if isinstance(data, bytes) else data.encode("utf-8"))
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return p
+
+
+def replace_private(path: PathLike, data: Union[str, bytes]) -> Path:
+    """Publish `data` at `path` atomically as a 0600 file: write a temp file in the same directory, then
+    os.replace it into place. Readers see either no file or the complete body, never a partial one."""
+    p = Path(path)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+    try:
+        write_private(tmp, data)  # O_CREAT|O_TRUNC|O_NOFOLLOW, 0600
+        os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return p
+
+
 def artifacts_root(workspace: PathLike) -> Path:
     """Default artifact root: <workspace>/artifacts (no env override)."""
     return Path(workspace) / "artifacts"
@@ -48,9 +89,7 @@ def task_dir(task_id: str, root: PathLike) -> Path:
 
 
 def ensure_task_dir(task_id: str, root: PathLike) -> Path:
-    d = task_dir(task_id, root)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return mkdir_private(task_dir(task_id, root))
 
 
 def task_dir_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[Path]:
@@ -70,14 +109,14 @@ def export_env(env: dict, art_dir: PathLike) -> dict:
 def write_result(art_dir: PathLike, output: str, rc: int) -> None:
     """Write output.md, result.md (same content) and rc."""
     d = Path(art_dir)
-    (d / OUTPUT).write_text(output, encoding="utf-8")
-    (d / RESULT).write_text(output, encoding="utf-8")
-    (d / RC).write_text(str(rc), encoding="utf-8")
+    write_private(d / OUTPUT, output)
+    write_private(d / RESULT, output)
+    write_private(d / RC, str(rc))
 
 
 def write_meta(art_dir: PathLike, *, task_id: str, agent: str, status: str,
                rc: int, started: float, finished: float) -> None:
-    (Path(art_dir) / META).write_text(
+    write_private(
+        Path(art_dir) / META,
         json.dumps({"task_id": task_id, "agent": agent, "status": status,
-                    "rc": rc, "started": started, "finished": finished}),
-        encoding="utf-8")
+                    "rc": rc, "started": started, "finished": finished}))

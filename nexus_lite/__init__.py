@@ -61,14 +61,12 @@ except _metadata.PackageNotFoundError:  # bare source tree / shipped bundle: rea
 _LAZY_MODULES = {"compute", "core", "demos"}
 
 _LAZY_SYMBOLS: dict[str, str] = {
-    # compute (zero-preinstall remote execution on Turing & Colab)
+    # compute (zero-preinstall remote execution on Colab & local sandbox)
     "compute_run": "compute",
     "pack_lite_bundle": "compute",
     "pack_self_contained_script": "compute",
     "run_local_sandbox": "compute",
     "run_on_colab": "compute",
-    "run_on_turing": "compute",
-    "turing_job_status": "compute",
     # core
     "chat": "core",
     "delegate": "core",
@@ -143,12 +141,10 @@ __all__ = [
     "roles",
     "protocol",
     "compute_run",
-    "run_on_turing",
     "run_on_colab",
     "run_local_sandbox",
     "pack_lite_bundle",
     "pack_self_contained_script",
-    "turing_job_status",
     "init",
     "get_workspace",
     "bus_send",

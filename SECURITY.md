@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest release on PyPI receives fixes.
+Only the latest release receives fixes.
 
 ## Reporting a problem
 

@@ -726,7 +726,7 @@ def run_phantom_shape_swarm(
         {
             "task_id": "spic6-worker",
             "prompt": (
-                "You are a quantitative radiomics specialist (Choi Lab). "
+                "You are a quantitative radiomics specialist (research lab). "
                 f"In 2-3 concise sentences, interpret these live 3D `spic6` (Choi 2021 CMPB) results across the 5 lung phantoms: "
                 f"{json.dumps(spic_data.get('rows', []))}"
             ),

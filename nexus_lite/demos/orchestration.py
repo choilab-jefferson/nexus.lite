@@ -1769,14 +1769,14 @@ def run_cooperative_problem_solver(
 
 
             def test_hipaa_pseudonymization_determinism_and_validation():
-                h1 = pseudonymize_patient_id("PT-1001", "choilab-salt")
-                h2 = pseudonymize_patient_id("  PT-1001  ", "choilab-salt")
+                h1 = pseudonymize_patient_id("PT-1001", "demo-salt")
+                h2 = pseudonymize_patient_id("  PT-1001  ", "demo-salt")
                 h3 = pseudonymize_patient_id("PT-1001", "other-salt")
                 assert h1 == h2
                 assert h1.startswith("ANON-") and len(h1) == 17
                 assert h1 != h3
                 with pytest.raises(ValueError):
-                    pseudonymize_patient_id("", "choilab-salt")
+                    pseudonymize_patient_id("", "demo-salt")
                 with pytest.raises(ValueError):
                     pseudonymize_patient_id("PT-1001", "   ")
 

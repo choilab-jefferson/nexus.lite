@@ -1,4 +1,4 @@
-"""nexus_lite.memory.{stm,mtm,ltm}: import isolation, deprecation shims, name identity (lite#20)."""
+"""nexus_lite.memory.{stm,mtm,ltm}: import isolation, deprecation shims, name identity."""
 
 import subprocess
 import sys

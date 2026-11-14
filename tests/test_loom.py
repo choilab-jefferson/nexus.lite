@@ -179,3 +179,22 @@ def test_nonzero_non_json_keeps_exit_status(fake, monkeypatch):
     monkeypatch.setenv("LOOM_FAKE_RC", "1")
     r = LoomAdapter().run_prompt("hi")
     assert r.status == "task_failure" and r.retryable and not r.ok
+
+
+def test_openai_base_url_allowlisted(fake, monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8123/v1")
+    r = LoomAdapter().run_prompt("hi")
+    assert "OPENAI_BASE_URL" in r.result["env"]
+
+
+def test_exec_stdin_is_devnull(fake, monkeypatch):
+    seen = {}
+    real = loom.subprocess.run
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(loom.subprocess, "run", spy)
+    assert LoomAdapter().run_prompt("hi").ok
+    assert seen["stdin"] is loom.subprocess.DEVNULL

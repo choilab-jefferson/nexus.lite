@@ -130,3 +130,10 @@ def test_bundle_version_matches_package(tmp_path):
     ).stdout.split()
     assert out[0].startswith(str(tmp_path))
     assert out[1] == nexus_lite.__version__ != "0+unknown"
+
+
+def test_cli_help_does_not_import_colab():
+    r = _py("import sys, nexus_lite.cli as c\n"
+            "try:\n c.main(['--help'])\nexcept SystemExit: pass\n"
+            "assert not [m for m in sys.modules if m.startswith('nexus_lite.colab')]\n")
+    assert r.returncode == 0, r.stderr

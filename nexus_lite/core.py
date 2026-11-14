@@ -36,11 +36,31 @@ from ._db import connect, get_db, get_db_path, get_workspace, init
 from .guard import current_delegation_depth, leaf_guard_error
 from .memory import mtm as _mtm
 from .memory import stm as stm_mod
+from .protocol import format_pointer_line, parse_handoffs, validate_bus_field
 from .phi import phi_gate_error
 from .provider_errors import _QUOTA_OR_AUTH_MARKERS as _PE_MARKERS
 from .provider_errors import is_quota_or_auth_failure
 from .roles import ROLE_FOR_AGENT, ROLE_PROMPTS
 
+
+
+def _argv0(cmd: Union[str, list[str], None], default: str = "") -> str:
+    """Basename of the executable in `cmd`, parsed with shlex exactly like the PHI gate
+    (a quoted first token such as `'"/opt/x y/bin/ollama" launch'` is one token, not a split on spaces)."""
+    if not cmd:
+        return default
+    if isinstance(cmd, str):
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            argv = cmd.split()
+    else:
+        argv = [str(x) for x in cmd]
+    return os.path.basename(argv[0]) if argv else default
+
+
+def _phi_on() -> bool:
+    return os.environ.get("NEXUS_SENSITIVITY") == "phi"
 
 
 _QUOTA_OR_AUTH_MARKERS = _PE_MARKERS
@@ -113,6 +133,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 _TERMINAL_STATUSES = ("completed", "failed", "escalated", "timeout")
+_BLOCKING_STATUSES = ("timeout", "skipped")  # a dependent of these never starts
 _STALE_GRACE_S = 30.0
 
 
@@ -157,7 +178,7 @@ def reap_stale_tasks() -> list[str]:
             if cur.rowcount:
                 reaped.append(r["id"])
                 try:
-                    (art / "reaped.txt").write_text(f"{status}: {reason}\n", encoding="utf-8")
+                    artifacts_mod.write_private(art / "reaped.txt", f"{status}: {reason}\n")
                 except Exception:
                     pass
     return reaped
@@ -187,6 +208,8 @@ def delegate(    agent_cmd: str,
     timeout: float = 120.0,
     fallback_cmd: Optional[str] = None,
     deadline: Optional[float] = None,
+    route_handoffs: bool = False,
+    completion_detail: bool = True,
 ) -> dict:
     """
     Delegate a subtask to a worker (a leaf agent process; in `mode="pty"` it runs inside a
@@ -195,18 +218,21 @@ def delegate(    agent_cmd: str,
     - Creates .nexus/artifacts/<task_id>/
     - Runs worker (in a dtach PTY session or subprocess)
     - Automatically retries in-place with `fallback_cmd` if `fallback_cmd` is provided and primary agent fails due to quota/weekly-limit/auth
+    - route_handoffs (opt-in): `[nexus] handoff <target> - <summary>` lines in the output are
+      sent via bus_send(kind="handoff", sender=task_id); invalid targets are skipped + logged
     - Writes output.md and rc
     - Updates SQLite tasks table
     - Completion channel: sends a `TASK_COMPLETE <task_id>: ...` (or `TASK_ESCALATE <task_id>: ...`)
-      message, kind "task", sender = task_id, to `caller` via bus_send
+      message, kind "task", sender = task_id, to `caller` via bus_send. With completion_detail=False (or
+      under PHI) the message carries the status only, never worker output or the escalation reason.
     """
-    err = leaf_guard_error(os.path.basename(agent_cmd.split()[0]) if agent_cmd.split() else "")
+    err = leaf_guard_error(_argv0(agent_cmd))
     if err:
         raise PermissionError(err)
     err = phi_gate_error(agent_cmd)
     if err:
         raise PermissionError(err)
-    if os.environ.get("NEXUS_SENSITIVITY") == "phi":
+    if _phi_on():
         fallback_cmd = None  # never fall back to a cloud CLI under PHI
     current_depth = current_delegation_depth() or 0
 
@@ -216,14 +242,12 @@ def delegate(    agent_cmd: str,
         task_id = f"t-{uuid.uuid4().hex[:8]}"
 
     art_dir = artifacts_mod.ensure_task_dir(task_id, artifacts_mod.artifacts_root(ws))
-    (art_dir / artifacts_mod.PROMPT).write_text(prompt, encoding="utf-8")
-    (art_dir / "timeout").write_text(str(timeout), encoding="utf-8")
-    (art_dir / "runner.pid").write_text(str(os.getpid()), encoding="utf-8")
+    artifacts_mod.write_private(art_dir / artifacts_mod.PROMPT, prompt)
+    artifacts_mod.write_private(art_dir / "timeout", str(timeout))
+    artifacts_mod.write_private(art_dir / "runner.pid", str(os.getpid()))
 
     ts_start = time.time()
-    cmd_text_for_stm = " ".join(str(x) for x in agent_cmd) if isinstance(agent_cmd, list) else str(agent_cmd)
-    ag_tok = cmd_text_for_stm.split()[0] if cmd_text_for_stm.split() else "worker"
-    ag_name = os.path.basename(ag_tok)[:32] or "worker"
+    ag_name = _argv0(agent_cmd, "worker")[:32] or "worker"
     first_prompt_ln = next((ln.strip() for ln in str(prompt).splitlines() if ln.strip()), task_id)
     stm_node_id = stm_mod.node_id_for_task(task_id)
     try:
@@ -351,25 +375,24 @@ def delegate(    agent_cmd: str,
         else:
             rc, output, stderr = _exec_oneshot(agent_cmd)
             if stderr:
-                (art_dir / "stderr.log").write_text(stderr, encoding="utf-8")
+                artifacts_mod.write_private(art_dir / "stderr.log", stderr)
             if (
                 fallback_cmd
                 and fallback_cmd != agent_cmd
                 and _is_quota_or_auth_failure(rc, output)
             ):
-                (art_dir / "primary_failed.log").write_text(
+                artifacts_mod.write_private(
+                    art_dir / "primary_failed.log",
                     f"cmd={agent_cmd}\nrc={rc}\n{output}",
-                    encoding="utf-8",
                 )
                 timed_out_flag[0] = False
                 fb_rc, fb_out, fb_err = _exec_oneshot(fallback_cmd)
                 if not _is_quota_or_auth_failure(fb_rc, fb_out) or fb_rc == 0:
                     rc, output = fb_rc, fb_out
                     resolved_agent_cmd = f"{agent_cmd} -> {fallback_cmd}"
-                    fb_tok = str(fallback_cmd).split()[0] if str(fallback_cmd).split() else ag_name
-                    ag_name = os.path.basename(fb_tok)[:32] or ag_name
+                    ag_name = _argv0(fallback_cmd, ag_name)[:32] or ag_name
                     if fb_err:
-                        (art_dir / "stderr.log").write_text(fb_err, encoding="utf-8")
+                        artifacts_mod.write_private(art_dir / "stderr.log", fb_err)
 
         artifacts_mod.write_result(art_dir, output, rc)
         ts_done = time.time()
@@ -381,9 +404,9 @@ def delegate(    agent_cmd: str,
                 if line_s.startswith("{") and "escalation_required" in line_s:
                     try:
                         esc_payload = json.loads(line_s)
-                        (art_dir / "escalation.json").write_text(
+                        artifacts_mod.write_private(
+                            art_dir / "escalation.json",
                             json.dumps(esc_payload, indent=2, ensure_ascii=False),
-                            encoding="utf-8",
                         )
                         break
                     except Exception:
@@ -429,7 +452,8 @@ def delegate(    agent_cmd: str,
             )
 
         if task_status == "escalated" and esc_payload is not None:
-            reason = esc_payload.get("reason", "escalation_required")
+            # `reason` is worker-controlled text: under PHI only the pointer (task id + status) leaves.
+            reason = task_status if (_phi_on() or not completion_detail) else esc_payload.get("reason", "escalation_required")
             _mtm.bus_send(
                 target=caller,
                 message=f"TASK_ESCALATE {task_id}: {reason}",
@@ -437,25 +461,29 @@ def delegate(    agent_cmd: str,
                 kind="task",
             )
         else:
-            summary_line = output.strip().splitlines()[0][:80] if output.strip() else f"rc={rc}"
+            summary_line = _result_line(output, rc, task_status) if completion_detail else str(task_status)
             _mtm.bus_send(
                 target=caller,
                 message=f"TASK_COMPLETE {task_id}: {summary_line}",
                 sender=task_id,
                 kind="task",
             )
+        if route_handoffs:
+            _route_handoffs(task_id, output, task_status)
         return rc, output, task_status, esc_payload
 
     if bg:
         spec = {
             "agent_cmd": agent_cmd, "prompt": prompt, "caller": caller, "task_id": task_id,
             "mode": mode, "timeout": timeout, "fallback_cmd": fallback_cmd,
+            "route_handoffs": route_handoffs, "completion_detail": completion_detail,
         }
         spec_path = art_dir / artifacts_mod.SPEC
-        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        artifacts_mod.write_private(spec_path, json.dumps(spec))
         runner_env = dict(child_env)
         runner_env["NEXUS_DELEGATION_DEPTH"] = str(current_depth)  # runner's delegate() re-adds the hop
         runner_log = open(art_dir / "runner.log", "ab")
+        os.fchmod(runner_log.fileno(), 0o600)
         try:
             runner = subprocess.Popen(
                 [sys.executable, "-c",
@@ -471,7 +499,7 @@ def delegate(    agent_cmd: str,
         finally:
             runner_log.close()  # child holds its own dup
         reap_in_background(runner)  # detached on purpose: outlives us; thread only reaps if we stay alive
-        (art_dir / "runner.pid").write_text(str(runner.pid), encoding="utf-8")
+        artifacts_mod.write_private(art_dir / "runner.pid", str(runner.pid))
         return {
             "task_id": task_id,
             "caller": caller,
@@ -493,33 +521,43 @@ def delegate(    agent_cmd: str,
         return res_dict
 
 
-def run_swarm(
+def _result_line(output: str, rc: Any, status: Any) -> str:
+    """One-line result for a completion message. PHI: status only (output is never put on the bus)."""
+    if _phi_on():
+        return str(status)
+    return output.strip().splitlines()[0][:80] if output.strip() else f"rc={rc}"
+
+
+def _route_handoffs(task_id: str, output: str, status: str = "completed") -> int:
+    """Route parsed handoff lines of `output` over the bus. Never raises; returns messages sent.
+    Target ALL (any case) is refused: a worker cannot broadcast. Under PHI the message is the pointer
+    (`HANDOFF <task_id>: <status>`), never the worker-written summary."""
+    sent = 0
+    for target, summary in parse_handoffs(output):
+        try:
+            validate_bus_field("target", target)
+            if target.upper() == "ALL":
+                raise ValueError("handoff target ALL (broadcast) is not allowed")
+            body = f"HANDOFF {task_id}: {status}" if _phi_on() else summary
+            _mtm.bus_send(target=target, message=body, sender=task_id, kind="handoff")
+            sent += 1
+        except Exception as exc:
+            sys.stderr.write(f"[nexus-lite] handoff from {task_id} skipped ({target!r}): {exc}\n")
+    return sent
+
+
+def _swarm_wave(
     specs: list[dict],
-    caller: str = "orchestrator",
-    timeout: float = 120.0,
-    live_viz: bool = False,
-    verbose: bool = False,
+    caller: str,
+    timeout: float,
+    verbose: bool,
+    on_dispatch=None,
 ) -> list[dict]:
-    """
-    Dispatch multiple subtasks in parallel (bg=True) and wait for completion.
-    Polls the SQLite tasks table until all tasks finish (or timeout).
-    Prints live worker completion lines if verbose=True (live_viz is deprecated and ignored).
-    Returns list of completed task dicts with output.
-    """
-    init()
+    """Dispatch `specs` concurrently (bg=True), poll the tasks table, return results in order.
+    `on_dispatch(i)` runs after spec `i` was dispatched successfully. Tasks still running at the
+    deadline are marked status `timeout` in the tasks table and in the result."""
     task_ids: list[str] = []
-    if live_viz:
-        warnings.warn(
-            "run_swarm(live_viz=...) is deprecated and ignored: the core renders no dashboards; "
-            "use nexus_lite.demos.viz.dashboard()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-    if any(str(s.get("cmd") or s.get("agent_cmd") or "").strip().startswith("opencode") for s in specs):
-        ensure_opencode(install=True)
-
-    for spec in specs:
+    for n, spec in enumerate(specs):
         cmd = spec.get("cmd") or spec.get("agent_cmd")
         prompt = spec.get("prompt", "")
         tid = spec.get("task_id")
@@ -535,8 +573,12 @@ def run_swarm(
             bg=True,
             timeout=timeout,
             fallback_cmd=fb_cmd,
+            route_handoffs=bool(spec.get("route_handoffs", False)),
+            completion_detail=bool(spec.get("completion_detail", True)),
         )
         task_ids.append(res["task_id"])
+        if on_dispatch is not None:
+            on_dispatch(n)
 
     swarm_t0 = time.monotonic()
     last_heartbeat = swarm_t0
@@ -592,6 +634,13 @@ def run_swarm(
 
     with connect() as con:
         placeholders = ",".join("?" for _ in task_ids)
+        terminal = ",".join("?" for _ in _TERMINAL_STATUSES)
+        # Deadline hit: whatever is not terminal is a timeout (rc stays NULL until the worker ends).
+        con.execute(
+            f"UPDATE tasks SET status = 'timeout', completed_at = ? "
+            f"WHERE id IN ({placeholders}) AND status NOT IN ({terminal});",
+            [time.time(), *task_ids, *_TERMINAL_STATUSES],
+        )
         cur = con.execute(
             f"""
             SELECT id, caller, agent_cmd, status, rc, created_at, completed_at, artifact_dir
@@ -619,6 +668,157 @@ def run_swarm(
         results.append(t)
 
     return results
+
+
+_SWARM_KEYS = ("depends_on", "subwave", "prompt_fn", "inject_bus_inbox", "bus_targets", "inbox_target")
+
+
+def _swarm_ident(spec: dict) -> Optional[str]:
+    return spec.get("id") or spec.get("task_id")
+
+
+def _plan_subwaves(specs: list[dict]) -> list[list[int]]:
+    """Group spec indexes into ordered sub-waves (Kahn levels, or explicit `subwave` ints).
+
+    No `depends_on`/`subwave` anywhere -> one wave (legacy). Unknown dep id, duplicate id used
+    as a dep, dependency cycle, or a dep in a later explicit subwave -> ValueError (nothing dispatched).
+    """
+    n = len(specs)
+    if not any(s.get("depends_on") or s.get("subwave") is not None for s in specs):
+        return [list(range(n))]
+    ids: dict[str, int] = {}
+    for i, s in enumerate(specs):
+        ident = _swarm_ident(s)
+        if ident:
+            if ident in ids:
+                raise ValueError(f"run_swarm: duplicate spec id {ident!r}")
+            ids[ident] = i
+    deps: list[set[int]] = []
+    for i, s in enumerate(specs):
+        d: set[int] = set()
+        for dep in s.get("depends_on") or []:
+            if dep not in ids:
+                raise ValueError(f"run_swarm: spec {_swarm_ident(s) or i!r} depends on unknown id {dep!r}")
+            d.add(ids[dep])
+        if i in d:
+            raise ValueError(f"run_swarm: spec {_swarm_ident(s) or i!r} depends on itself")
+        deps.append(d)
+    level: dict[int, int] = {}
+    remaining = set(range(n))
+    while remaining:
+        ready = [i for i in sorted(remaining) if all(j in level for j in deps[i])]
+        if not ready:
+            raise ValueError("run_swarm: dependency cycle among specs")
+        for i in ready:
+            base = max((level[j] + 1 for j in deps[i]), default=0)
+            sw = specs[i].get("subwave")
+            if sw is not None:
+                if not isinstance(sw, int) or isinstance(sw, bool) or sw < 0:
+                    raise ValueError(f"run_swarm: subwave must be an int >= 0, got {sw!r}")
+                if sw < base:
+                    raise ValueError(f"run_swarm: subwave {sw} runs before a dependency (needs >= {base})")
+                base = sw
+            level[i] = base
+            remaining.discard(i)
+    waves: dict[int, list[int]] = {}
+    for i in range(n):
+        waves.setdefault(level[i], []).append(i)
+    return [waves[k] for k in sorted(waves)]
+
+
+def run_swarm(
+    specs: list[dict],
+    caller: str = "orchestrator",
+    timeout: float = 120.0,
+    live_viz: bool = False,
+    verbose: bool = False,
+) -> list[dict]:
+    """
+    Dispatch multiple subtasks in parallel (bg=True) and wait for completion.
+    Polls the SQLite tasks table until all tasks finish (or timeout).
+    Prints live worker completion lines if verbose=True (live_viz is deprecated and ignored).
+    Returns list of completed task dicts with output, in `specs` order.
+
+    Optional per-spec keys, all absent = one concurrent wave, as before:
+      id / task_id       identifier other specs name in `depends_on`.
+      depends_on         list of ids; the spec runs in a later sub-wave than each of them.
+      subwave            explicit int sub-wave (>= its dependencies' level + 1).
+      prompt_fn          callable(results_so_far: list[dict]) -> str, evaluated right before the
+                         spec's sub-wave launches (results of all earlier sub-waves, spec order).
+      inject_bus_inbox   True: prepend unacked bus pointers for the spec's inbox target
+                         (`inbox_target`, default its id) read with consumer="turn", then ack them.
+      route_handoffs     True: route `[nexus] handoff <target> - <summary>` output lines over the bus.
+      bus_targets        list of bus targets that get `TASK_COMPLETE <id>: <summary>` after the spec ends.
+    Sub-wave N+1 starts after every task of sub-wave N finished; `timeout` applies per sub-wave.
+    An unknown dependency id or a cycle raises ValueError before anything is dispatched.
+    """
+    init()
+    if live_viz:
+        warnings.warn(
+            "run_swarm(live_viz=...) is deprecated and ignored: the core renders no dashboards; "
+            "use nexus_lite.demos.viz.dashboard()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    waves = _plan_subwaves(specs)
+
+    if any(str(s.get("cmd") or s.get("agent_cmd") or "").strip().startswith("opencode") for s in specs):
+        ensure_opencode(install=True)
+
+    if len(waves) == 1 and not any(k in s for s in specs for k in _SWARM_KEYS):
+        return _swarm_wave(specs, caller, timeout, verbose)
+
+    results: list[Optional[dict]] = [None] * len(specs)
+    index_of = {ident: i for i, sp in enumerate(specs) if (ident := _swarm_ident(sp))}
+    for wave in waves:
+        wave_specs: list[dict] = []
+        wave_idx: list[int] = []
+        pending_acks: dict[int, tuple[str, int]] = {}  # wave position -> (inbox, seq) to ack once dispatched
+        for i in wave:
+            blocked = [
+                d for d in specs[i].get("depends_on") or []
+                if (results[index_of[d]] or {}).get("status") in _BLOCKING_STATUSES
+            ]
+            if blocked:  # a dependency timed out (or was itself skipped): do not start this spec
+                results[i] = {
+                    "id": _swarm_ident(specs[i]) or f"skipped-{i}", "task_id": _swarm_ident(specs[i]) or f"skipped-{i}",
+                    "status": "skipped", "rc": -1, "output": "", "skipped_because": blocked,
+                }
+                continue
+            spec = {k: v for k, v in specs[i].items() if k not in _SWARM_KEYS}
+            fn = specs[i].get("prompt_fn")
+            if fn is not None:
+                spec["prompt"] = fn([r for r in results if r is not None])
+            ident = _swarm_ident(specs[i])
+            inbox = specs[i].get("inbox_target") or ident
+            if specs[i].get("inject_bus_inbox") and inbox:
+                msgs = _mtm.bus_read(target=inbox, unacked=True, consumer="turn")
+                if msgs:
+                    ptrs = "\n".join(
+                        format_pointer_line(m["kind"], m["id"], m["path"], m["summary"]) for m in msgs
+                    )
+                    spec["prompt"] = ptrs + "\n\n" + str(spec.get("prompt", ""))
+                    pending_acks[len(wave_specs)] = (inbox, max(m["seq"] for m in msgs))
+            wave_specs.append(spec)
+            wave_idx.append(i)
+
+        def _ack_turn(n: int, _acks=pending_acks) -> None:  # cursor moves only once the spec was dispatched
+            if n in _acks:
+                tgt, seq = _acks.pop(n)
+                _mtm.bus_ack(tgt, seq, consumer="turn")
+
+        if wave_specs:
+            for i, r in zip(wave_idx, _swarm_wave(wave_specs, caller, timeout, verbose, on_dispatch=_ack_turn)):
+                results[i] = r
+                for tgt in specs[i].get("bus_targets") or []:
+                    _mtm.bus_send(
+                        target=tgt,
+                        message=f"TASK_COMPLETE {r['task_id']}: {_result_line(r.get('output') or '', r.get('rc'), r.get('status'))}",
+                        sender=r["task_id"],
+                        kind="task",
+                    )
+    return results  # type: ignore[return-value]  # every slot is filled (run or skipped)
 
 
 def run_pipeline(
@@ -688,10 +888,14 @@ def run_pipeline(
         # If not the last stage, send HANDOFF message
         if i < len(stages) - 1:
             next_stage_name = stages[i + 1].get("name") or f"stage-{i + 2}"
-            summary = output.strip().splitlines()[0][:80] if output.strip() else "stage completed"
+            if _phi_on():  # pointer only: stage output never goes on the bus under PHI
+                body = f"HANDOFF {stage_name} to {next_stage_name}: {res.get('status')}"
+            else:
+                summary = output.strip().splitlines()[0][:80] if output.strip() else "stage completed"
+                body = f"HANDOFF {stage_name} to {next_stage_name}: {summary}\n\nArtifact output:\n{output}"
             _mtm.bus_send(
                 target=caller,
-                message=f"HANDOFF {stage_name} to {next_stage_name}: {summary}\n\nArtifact output:\n{output}",
+                message=body,
                 sender=stage_name,
                 kind="handoff",
             )

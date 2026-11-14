@@ -5,6 +5,7 @@ Subcommands:
 - init
 - pty (new/list/read/send/keys/wait/kill)
 - bus (send/read)
+- agent run (one command per bus message)
 - delegate
 - wiki (write/read/search/list)
 - chat
@@ -16,14 +17,16 @@ Demo and orchestration scenarios (demo, multi-tier, interact, cooperate, dashboa
 
 from __future__ import annotations
 
+import os
 import argparse
+import importlib
 import json
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-from . import compute, core, pty
+from . import cas, compute, core, pty
 from .memory import ltm as mem_ltm
 from .memory import mtm as mem_mtm
 from .memory import stm as mem_stm
@@ -101,14 +104,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_bus_send = bus_sub.add_parser("send", help="Send a message (lite verb 'bus send' = nexus say/dm/relay) to an agent name or a live PTY session")
     p_bus_send.add_argument("target", help="Target agent name or PTY session name, or ALL (broadcast to live sessions)")
     p_bus_send.add_argument("message", help="Message body")
-    p_bus_send.add_argument("--sender", default="user", help="Sender identifier")
+    p_bus_send.add_argument("--sender", default=None,
+                            help="Sender identifier (default: $NEXUS_AGENT, the agent itself; else 'user')")
     p_bus_send.add_argument("--kind", default="dm", help="Message kind (dm, broadcast, task); stored as-is in the pointer line")
 
     p_bus_read = bus_sub.add_parser("read", help="Read messages from the bus")
-    p_bus_read.add_argument("--target", default=None, help="Filter by target name")
+    p_bus_read.add_argument("--target", default=None,
+                            help="Filter by target name (default: $NEXUS_AGENT, the agent's own inbox; else all)")
     p_bus_read.add_argument("--limit", type=int, default=20, help="Max messages to return")
     p_bus_read.add_argument("--since-seq", type=int, default=None, help="Only messages with seq > N")
-    p_bus_read.add_argument("--unacked", action="store_true", help="Only unacked for --target")
+    p_bus_read.add_argument("--full", action="store_true", help="Also print each message's whole body")
+    p_bus_read.add_argument("--unacked", action="store_true",
+                            help="Only unacked for --target (each line shows seq=N; ack with `bus ack TARGET N`)")
 
     p_bus_ack = bus_sub.add_parser("ack", help="Ack messages up to seq for a target")
     p_bus_ack.add_argument("target")
@@ -137,7 +144,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.add_argument("--timeout", type=float, default=120.0, help="Timeout in seconds")
 
     # tasks
+    p_art = sub.add_parser("artifacts", help="Offline content-addressed artifact verbs (add, commit, status, diff)")
+    art_sub = p_art.add_subparsers(dest="art_subcommand")
+    for _n, _h in (("add", "Stage files into the CAS"), ("commit", "Write ARTIFACT_MANIFEST.json for staged + committed files"),
+                   ("status", "Show staged / changed files vs the last manifest"), ("diff", "Show per-file sha changes vs the last manifest")):
+        _p = art_sub.add_parser(_n, help=_h)
+        _p.add_argument("--dir", default=".", help="Artifact directory (default: cwd)")
+        if _n == "add":
+            _p.add_argument("paths", nargs="*", help="Relative paths to stage (default: all)")
+
     sub.add_parser("tasks", help="List tasks (reaps stale 'running' rows first)")
+    sub.add_parser("agent", help="agent run NAME -- COMMAND: run a command once per bus message (see `nexus-lite agent -h`)")
+    sub.add_parser("ballot", help="ballot open/cast/status: agreement among agents done by code (see `nexus-lite ballot -h`)")
+    sub.add_parser("job", help="Detached jobs: start/status/wait/check/tail/stop/list (see `nexus-lite job -h`)")
 
     # wiki
     p_wiki = sub.add_parser("wiki", help="Local markdown wiki commands")
@@ -187,15 +206,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_loom_inst.add_argument("--version", default=None, help="loom version (default: pinned LOOM_VERSION)")
     p_loom_inst.add_argument("--dest", default=None, help="Install path (default: ~/.local/bin/loom)")
 
-    # compute (zero-preinstall ship-lite-and-compute for Turing & Colab)
+    # compute (zero-preinstall ship-lite-and-compute for Colab & local sandbox)
     p_comp = sub.add_parser(
         "compute",
-        help="Ship nexus-lite and execute computations on Turing HPC (internal) or Google Colab (external) without pre-installation",
+        help="Ship nexus-lite and execute computations on Google Colab or a local sandbox without pre-installation",
     )
     p_comp.add_argument(
         "target",
-        choices=["turing", "hpc", "colab", "local"],
-        help="Compute target: 'turing'/'hpc' (internal SLURM HPC), 'colab' (external Colab runtime), or 'local' (isolated sandbox)",
+        choices=["colab", "local"],
+        help="Compute target: 'colab' (Colab runtime) or 'local' (isolated sandbox)",
     )
     p_comp.add_argument("--python", "-c", default=None, help="Inline Python code to run (has `nexus_lite`/`nl`, `WORKSPACE`, `JOB_DIR`, `RESULT`)")
     p_comp.add_argument("--script", "-s", default=None, help="Path to local Python script file to ship and execute")
@@ -203,28 +222,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_comp.add_argument("--lite", default=None, help="nexus-lite CLI arguments string (e.g. 'tasks')")
     p_comp.add_argument("--file", action="append", default=None, help="Extra file to stage into remote job dir (format: local_path or remote_name=local_path)")
     p_comp.add_argument("--collect", action="append", default=None, help="Remote relative file path to collect back in result JSON")
-    p_comp.add_argument("--mode", default="srun", choices=["srun", "ssh", "sbatch"], help="HPC execution mode (default: srun)")
-    p_comp.add_argument("--partition", "-p", default="batch", help="SLURM partition name (default: batch)")
-    p_comp.add_argument("--gres", default=None, help="SLURM GRES specification (e.g. gpu:1 or gpu:l40s:1)")
-    p_comp.add_argument("--cpus", type=int, default=2, help="SLURM CPUs per task (default: 2)")
-    p_comp.add_argument("--mem", default=None, help="SLURM memory limit (e.g. 16G)")
-    p_comp.add_argument("--time", dest="time_limit", default="00:10:00", help="SLURM time limit (default: 00:10:00)")
-    p_comp.add_argument("--host", default=None, help="Override HPC SSH host (default: $NEXUS_TURING_HOST / $NEXUS_HPC_HOST / 'turing')")
-    p_comp.add_argument("--status", dest="status_job_id", default=None, help="Check status/result of an sbatch job ID")
-    p_comp.add_argument("--slurm-id", default=None, help="Optional SLURM numeric job ID when checking --status")
     p_comp.add_argument("--url", default=None, help="Colab tunnel URL (default: $NEXUS_COLAB_URL or .nexus/tunnel.json)")
     p_comp.add_argument("--token", default=None, help="Colab tunnel bearer token")
+    p_comp.add_argument("--session", dest="colab_session", default=None, help="Colab CLI session name (runs via `colab exec`; no tunnel needed)")
     p_comp.add_argument("--ssh", dest="colab_ssh", default=None, help="Colab SSH host (default: $NEXUS_COLAB_SSH)")
     p_comp.add_argument("--bootstrap-out", default=None, help="Write a standalone self-extracting Colab .py bundle to this path")
     p_comp.add_argument("--start-tunnel", action="store_true", help="Start nexus_lite.colab.tunnel inside the remote Colab runtime")
     p_comp.add_argument("--timeout", type=float, default=300.0, help="Execution timeout in seconds (default: 300)")
 
+    sub.add_parser("pc", help="Manage dedicated Colab Agent PC workstations (bind, ls, status, unbind, checkout, run, poll, pty, publish)")
+    sub.add_parser("colab", help="Colab tunnel & Agent PC commands (start, stop, status, exec, pc)")
+
     return parser
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    eff_argv = list(sys.argv[1:] if argv is None else argv)
+    if eff_argv and eff_argv[0] == "ballot":
+        # agreement among agents done by code (own parser)
+        return int(importlib.import_module(".ballot", __package__).cli_main(eff_argv[1:]) or 0)
+    if eff_argv and eff_argv[0] == "job":
+        # detached jobs have their own argument parser (the command after `--` is passed through untouched)
+        return int(importlib.import_module(".jobs", __package__).cli_main(eff_argv[1:]) or 0)
+    if eff_argv and eff_argv[0] == "agent":
+        # agent run has its own parser: the command after `--` is passed through untouched
+        return int(importlib.import_module(".agent_run", __package__).cli_main(eff_argv[1:]) or 0)
+    if eff_argv and eff_argv[0] in ("pc", "colab"):
+        # Lazy dispatch keeps the kernel import boundary: colab is loaded only on demand.
+        tunnel_mod = importlib.import_module(".colab.tunnel", __package__)
+        return int(tunnel_mod.main(eff_argv if eff_argv[0] == "pc" else eff_argv[1:]) or 0)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(eff_argv)
 
     if not args.subcommand:
         parser.print_help()
@@ -286,19 +314,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 0
 
             if args.bus_subcommand == "send":
-                res = mem_mtm.bus_send(args.target, args.message, sender=args.sender, kind=args.kind)
+                sender = args.sender or os.environ.get("NEXUS_AGENT") or "user"  # an agent sends as itself
+                res = mem_mtm.bus_send(args.target, args.message, sender=sender, kind=args.kind)
                 print(f"Sent message {res['id']} to {res['target']}")
                 return 0
 
             elif args.bus_subcommand == "read":
                 msgs = mem_mtm.bus_read(
-                    target=args.target, limit=args.limit, since_seq=args.since_seq, unacked=args.unacked
+                    target=args.target or os.environ.get("NEXUS_AGENT") or None, limit=args.limit,
+                    since_seq=args.since_seq, unacked=args.unacked
                 )
                 if not msgs:
                     print("No messages.")
                 else:
                     for m in msgs:
-                        print(f"[{m['kind']}] {m['id']} {m['sender']} -> {m['target']}: {m['summary']}")
+                        # seq is what `bus ack <target> <seq>` takes; the summary is one line (100 chars), so the line
+                        # also names the body file, as the PTY pointer does; --full prints the body itself
+                        print(f"[{m['kind']}] seq={m['seq']} {m['id']} {m['sender']} -> {m['target']}: {m['summary']}"
+                              f" (body: {m['path']})")
+                        if args.full:
+                            print(m.get("content") or "")
+                            print()
                 return 0
 
             elif args.bus_subcommand == "ack":
@@ -329,6 +365,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             print(json.dumps(res, indent=2))
             return status_exit_code(res)
+
+        elif args.subcommand == "artifacts":
+            if not args.art_subcommand:
+                parser.parse_args(["artifacts", "--help"])
+                return 0
+            if args.art_subcommand == "add":
+                print(json.dumps(cas.add(args.dir, args.paths), indent=2))
+            elif args.art_subcommand == "commit":
+                print(cas.commit(args.dir))
+            elif args.art_subcommand == "status":
+                print(json.dumps(cas.status(args.dir), indent=2))
+            else:
+                print(json.dumps(cas.diff(args.dir), indent=2))
+            return 0
 
         elif args.subcommand == "tasks":
             print(json.dumps(core.list_tasks(), indent=2))
@@ -414,16 +464,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif args.subcommand == "compute":
             import shlex as _shlex
 
-            if args.target in ("turing", "hpc") and args.status_job_id:
-                res = compute.turing_job_status(
-                    args.status_job_id,
-                    slurm_job_id=args.slurm_id,
-                    ssh_host=args.host,
-                    timeout=args.timeout,
-                )
-                print(json.dumps(res, indent=2, ensure_ascii=False))
-                return 0 if res.get("ok", True) else EXIT_FAILED
-
             py_code = args.python
             if args.script:
                 py_code = Path(args.script).expanduser().read_text(encoding="utf-8")
@@ -438,23 +478,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     rname = Path(item).name
                 extra_files[rname] = Path(lpath).expanduser().read_text(encoding="utf-8")
 
-            if args.target in ("turing", "hpc"):
-                res = compute.run_on_turing(
-                    python=py_code,
-                    cmd=args.cmd,
-                    lite_argv=lite_argv,
-                    files=extra_files or None,
-                    collect_files=args.collect,
-                    mode=args.mode,
-                    partition=args.partition,
-                    gres=args.gres,
-                    cpus=args.cpus,
-                    mem=args.mem,
-                    time_limit=args.time_limit,
-                    ssh_host=args.host,
-                    timeout=args.timeout,
-                )
-            elif args.target == "colab":
+            if args.target == "colab":
                 res = compute.run_on_colab(
                     python=py_code,
                     cmd=args.cmd,
@@ -467,6 +491,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     bootstrap_out=args.bootstrap_out,
                     start_tunnel=args.start_tunnel,
                     timeout=args.timeout,
+                    colab_session=args.colab_session,
                 )
             else:
                 res = compute.run_local_sandbox(

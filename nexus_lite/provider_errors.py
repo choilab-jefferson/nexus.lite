@@ -2,7 +2,7 @@
 
 ``classify_provider_error(rc, output)`` returns ``'rate_limit' | 'quota' | 'auth' | None``.
 No Redis, circuit breaker or ledger. A richer downstream extension (breaker,
-per-pool state) lives in nexus.code ``core/load_balancer/quota.py``.
+per-pool state) can be layered on top by consumers.
 """
 
 from __future__ import annotations

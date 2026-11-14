@@ -21,7 +21,9 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -30,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
-from ._db import mark_session
+from ._db import get_workspace, mark_session
 from ._proc import reap_in_background
 
 # dtach wire protocol constants
@@ -158,17 +160,52 @@ def _winch_packet(rows: int, cols: int) -> bytes:
     return _PKT.pack(MSG_WINCH, 0, ws)
 
 
-# Public aliases (Gap G1, #21): nexus.code imports these; private names kept.
+# Public aliases: downstream consumers import these; private names kept.
 PKT = _PKT
 PUSH_MAX = _PUSH_MAX
 packet = _packet
 winch_packet = _winch_packet
 
 
+SUN_PATH_MAX = 103   # macOS sun_path is 104 bytes with the NUL (Linux 108)
+SOCK_NAME_BUDGET = 40  # session-name bytes the default directory must leave room for
+
+
+def default_sock_dir() -> str:
+    """Workspace-scoped runtime socket dir: <ws>/run, or /tmp/nx-<workspace hash> when <ws>/run leaves too little
+    room for a socket name. Never a plain shared /tmp; the hash only separates namespaces (not a secret)."""
+    ws = get_workspace()
+    run = str(ws / "run")
+    if len(run.encode()) + len("/nexus-lite-.sock") + SOCK_NAME_BUDGET <= SUN_PATH_MAX:
+        return run
+    return "/tmp/nx-" + hashlib.sha256(str(ws).encode()).hexdigest()[:12]
+
+
+def _ensure_private_dir(d: str) -> None:
+    """Create `d` 0700; refuse a symlink or a directory owned by another user (a pre-planted /tmp path)."""
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise RuntimeError(f"socket directory {d} is not a directory owned by this user; refusing to use it")
+
+
 def get_sock_dir() -> str:
-    """Return socket directory from NEXUS_LITE_SOCK_DIR or default /tmp."""
-    d = os.environ.get("NEXUS_LITE_SOCK_DIR", "/tmp")
-    os.makedirs(d, exist_ok=True)
+    """Socket directory: NEXUS_LITE_SOCK_DIR if set, else the workspace-scoped default_sock_dir().
+    spawn, lookup, pointer injection and kill all resolve sockets through this one helper."""
+    d = os.environ.get("NEXUS_LITE_SOCK_DIR")
+    if d:
+        os.makedirs(d, exist_ok=True)
+        return d
+    d = default_sock_dir()
+    if d.startswith("/tmp/nx-"):
+        _ensure_private_dir(d)
+    else:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(d, 0o700)
     return d
 
 
@@ -240,15 +277,109 @@ def _probe_connect(path: str, timeout: float = 0.5) -> bool:
             pass
 
 
-def find_dtach_master_pid(sock_path: str) -> Optional[int]:
-    """PID of the dtach process that OWNS ``sock_path`` (its master, not a client).
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # EPERM: exists
+    return True
 
-    Candidates: processes whose argv[0] basename is ``dtach`` and whose argv
-    carries ``sock_path`` as an EXACT token. Flags cannot tell master from
-    client (``-A`` appears on both), but only the master owns a child (the
-    inner PTY leader, ``/proc/<pid>/task/<pid>/children``). Exactly one
-    candidate with children wins; zero or several is ambiguous -> None. Never
-    guesses. Never raises."""
+
+def _read_pid_sidecar(sock_path: str) -> Optional[int]:
+    try:
+        pid = int(Path(f"{sock_path}.pid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid > 0 and _pid_alive(pid) and _pid_argv_has(pid, sock_path):
+        return pid
+    return None
+
+
+def _pid_argv_has(pid: int, token: str) -> bool:
+    """True if ``token`` is an exact argv element of ``pid`` (PID-reuse guard)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return token.encode() in f.read().split(b"\0")
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+        return token in shlex.split(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _write_pid_sidecar(sock_path: str, pid: int) -> None:
+    try:
+        Path(f"{sock_path}.pid").write_text(f"{pid}\n")
+    except OSError:
+        pass
+
+
+def _ps_table() -> list:
+    """(pid, ppid, pgid) of every process, from ``ps`` (Linux and macOS)."""
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid="], capture_output=True, text=True, timeout=5).stdout
+    rows = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and all(x.isdigit() for x in parts):
+            rows.append(tuple(int(x) for x in parts))
+    return rows
+
+
+def _leader_pgid(master_pid: int) -> Optional[int]:
+    """pgid of the PTY leader (the master's child that leads its own group). None if not exactly one."""
+    try:
+        groups = {pgid for pid, ppid, pgid in _ps_table() if ppid == master_pid and pid == pgid}
+    except Exception:
+        return None
+    return groups.pop() if len(groups) == 1 else None
+
+
+def _record_pgid(sock_path: str) -> None:
+    """Write <sock>.pgid for the session's PTY leader group (best effort; kill falls back to the master)."""
+    master = find_dtach_master_pid(sock_path)
+    end = time.monotonic() + 2.0
+    pgid = None
+    while master and pgid is None and time.monotonic() < end:
+        pgid = _leader_pgid(master)
+        if pgid is None:
+            time.sleep(0.05)
+    if pgid:
+        with contextlib.suppress(OSError):
+            Path(f"{sock_path}.pgid").write_text(f"{pgid}\n")
+
+
+def _group_members(pgid: int) -> list:
+    try:
+        return [pid for pid, _ppid, g in _ps_table() if g == pgid]
+    except Exception:
+        return []
+
+
+def _kill_group(pgid: int, grace_s: float = 1.0) -> list:
+    """SIGTERM the group, wait up to grace_s, SIGKILL the rest; return pids still in the group afterwards.
+    Our own group is never signalled."""
+    if pgid <= 1 or pgid == os.getpgid(0):
+        return []
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGTERM)
+    end = time.monotonic() + grace_s
+    while time.monotonic() < end and _group_members(pgid):
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+    end = time.monotonic() + 1.0
+    while time.monotonic() < end and _group_members(pgid):
+        time.sleep(0.05)
+    return _group_members(pgid)
+
+
+def _scan_proc(sock_path: str) -> Optional[int]:
+    """Linux /proc scan; see find_dtach_master_pid."""
     matches: list[int] = []
     try:
         for cmdline_path in glob.glob("/proc/[0-9]*/cmdline"):
@@ -276,6 +407,54 @@ def find_dtach_master_pid(sock_path: str) -> Optional[int]:
         if kids:
             with_children.append(pid)
     return with_children[0] if len(with_children) == 1 else None
+
+
+def _scan_ps(sock_path: str) -> Optional[int]:
+    """macOS/BSD fallback: parse ``ps -axo pid=,ppid=,command=`` (no pgrep needed)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    matches: list[int] = []
+    parents: set[int] = set()
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+            argv = shlex.split(parts[2])
+        except ValueError:
+            continue
+        parents.add(ppid)
+        if argv and os.path.basename(argv[0]) == "dtach" and sock_path in argv:
+            matches.append(pid)
+    with_children = [p for p in matches if p in parents]
+    return with_children[0] if len(with_children) == 1 else None
+
+
+def find_dtach_master_pid(sock_path: str) -> Optional[int]:
+    """PID of the process that OWNS ``sock_path`` (its master, not a client).
+
+    Order: (1) live ``<sock>.pid`` sidecar (written by spawn() and the stdlib
+    fallback daemon); (2) Linux ``/proc`` scan; (3) ``ps`` parse when ``/proc``
+    is absent (macOS/BSD). The scans pick processes whose argv[0] basename is
+    ``dtach`` and whose argv carries ``sock_path`` as an EXACT token; only the
+    master owns a child (the inner PTY leader), so exactly one candidate with
+    children wins; zero or several is ambiguous -> None. Never guesses. Never
+    raises."""
+    try:
+        pid = _read_pid_sidecar(sock_path)
+        if pid is not None:
+            return pid
+        if os.path.isdir("/proc"):
+            return _scan_proc(sock_path)
+        return _scan_ps(sock_path)
+    except Exception:
+        return None
 
 
 _find_dtach_pid = find_dtach_master_pid  # backward-compatible alias
@@ -409,39 +588,100 @@ def _parse_opencode_model(cmd: Union[str, list[str]]) -> Optional[str]:
     return None
 
 
+CLAUDE_DECLUTTER_SETTINGS: dict[str, object] = {
+    "prefersReducedMotion": True,
+    "spinnerTipsEnabled": False,
+    "terminalProgressBarEnabled": False,
+}
+AGY_DECLUTTER_SETTINGS: dict[str, object] = {
+    "altScreenMode": False,
+    "showTips": False,
+    "showFeedbackSurvey": False,
+    "artifactReviewPolicy": "always-proceed",
+}
+COPILOT_SCREEN_READER_ARGS: tuple[str, ...] = (
+    "--screen-reader",
+    "--plain-diff",
+    "--no-mouse",
+    "--no-auto-update",
+)
+GEMINI_SCREEN_READER_ARGS: tuple[str, ...] = ("--screen-reader",)
+
+_AGENT_BINS = ("claude", "agy", "copilot", "gemini")
+
+
+def _settings_arg(settings: dict[str, object]) -> str:
+    return shlex.quote(json.dumps(settings, separators=(",", ":")))
+
+
+def _normalize_known_agent(
+    cmd: Union[str, list[str]], mode: str, prompt: Optional[str], declutter: bool
+) -> Optional[str]:
+    """Build the command for claude/agy/copilot/gemini, or None if `cmd` is not one of them."""
+    try:
+        toks = list(cmd) if isinstance(cmd, list) else shlex.split(cmd)
+    except ValueError:
+        return None
+    if not toks or toks[0] not in _AGENT_BINS:
+        return None
+    bin_ = toks[0]
+    has = set(toks)
+    out = list(toks)
+
+    def add(*flags: str) -> None:
+        for f in flags:
+            if f not in has:
+                out.append(f)
+                has.add(f)
+
+    extra: list[str] = []
+    if bin_ in ("claude", "agy"):
+        if bin_ == "agy" or "--permission-mode" not in has:
+            add("--dangerously-skip-permissions")
+        if declutter:
+            if bin_ == "claude":
+                if os.environ.get("NEXUS_CLAUDE_SCREEN_READER") != "0":
+                    add("--ax-screen-reader")
+                if "--settings" not in has:
+                    extra += ["--settings", _settings_arg(CLAUDE_DECLUTTER_SETTINGS)]
+            elif "--settings" not in has:
+                extra += ["--settings", _settings_arg(AGY_DECLUTTER_SETTINGS)]
+    elif bin_ == "copilot":
+        add("--allow-all-tools")
+        if declutter and os.environ.get("NEXUS_COPILOT_SCREEN_READER") != "0":
+            add(*COPILOT_SCREEN_READER_ARGS)
+    else:  # gemini
+        if "--yolo" not in has:
+            add("-y")
+        if (declutter and mode == "pty" and os.environ.get("NEXUS_GEMINI_SCREEN_READER") != "0"):
+            add(*GEMINI_SCREEN_READER_ARGS)
+    line = " ".join([shlex.quote(t) for t in out] + extra)
+    if mode != "pty" and prompt is not None:
+        line += " -p " + shlex.quote(prompt)
+    return line
+
+
 def normalize_agent_cmd(
     cmd: Union[str, list[str]],
     mode: str = "pty",
     prompt: Optional[str] = None,
+    declutter: Optional[bool] = None,
 ) -> Union[str, list[str]]:
     """
     Normalize agent command for pty or oneshot execution.
-    - Expands "agy" or "claude" (with or without "--dangerously-skip-permissions") to
-      "<agent> --dangerously-skip-permissions" in pty mode, and
-      "<agent> --dangerously-skip-permissions -p " + shlex.quote(prompt) in oneshot mode.
+    - claude/agy/copilot/gemini get their auto-approve flag; in pty mode (declutter default on,
+      opt out with NEXUS_LITE_PTY_DECLUTTER=0) also screen-reader / declutter flags so TUI
+      animations, borders and alt-screen noise do not reach the orchestrator.
+      Oneshot mode appends "-p <prompt>" and declutters only if declutter=True.
     - Expands "opencode" (or "opencode -m <model>" / "opencode/<model>") to use
       OpenCode's built-in zero-signup free models (default: opencode/big-pickle) via
       "opencode run --standalone --auto -m <model> <prompt>" in oneshot mode.
     """
-    agent_bin: Optional[str] = None
-    if isinstance(cmd, list):
-        if cmd in (["agy"], ["agy", "--dangerously-skip-permissions"]):
-            agent_bin = "agy"
-        elif cmd in (["claude"], ["claude", "--dangerously-skip-permissions"]):
-            agent_bin = "claude"
-    elif isinstance(cmd, str):
-        stripped = cmd.strip()
-        if stripped in ("agy", "agy --dangerously-skip-permissions"):
-            agent_bin = "agy"
-        elif stripped in ("claude", "claude --dangerously-skip-permissions"):
-            agent_bin = "claude"
-
-    if agent_bin:
-        if mode == "pty":
-            return f"{agent_bin} --dangerously-skip-permissions"
-        if prompt is not None:
-            return f"{agent_bin} --dangerously-skip-permissions -p " + shlex.quote(prompt)
-        return f"{agent_bin} --dangerously-skip-permissions"
+    if declutter is None:
+        declutter = mode == "pty" and os.environ.get("NEXUS_LITE_PTY_DECLUTTER", "1") != "0"
+    known = _normalize_known_agent(cmd, mode, prompt, declutter)
+    if known is not None:
+        return known
 
     opencode_model = _parse_opencode_model(cmd)
     if opencode_model is not None:
@@ -463,9 +703,6 @@ def spawn(
     env: Optional[dict] = None,
 ) -> str:
     """Launch a command inside a persistent dtach PTY session and return session name."""
-    if shutil.which("dtach") is None:
-        raise RuntimeError("dtach binary not found on PATH. Install via apt-get install dtach")
-
     cmd = normalize_agent_cmd(cmd, mode="pty")
 
     if not name:
@@ -480,7 +717,7 @@ def spawn(
                 os.unlink(sp)
             except OSError:
                 pass
-            for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark"):
+            for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid"):
                 if os.path.exists(sibling):
                     try:
                         os.unlink(sibling)
@@ -491,7 +728,11 @@ def spawn(
     shell = os.environ.get("SHELL", "/bin/bash")
     cd_prefix = f"cd {shlex.quote(str(cwd))} && " if cwd else ""
     inner = f"{cd_prefix}{cmd_str}"
-    argv = ["dtach", "-n", sp, "-z", "-r", "winch", shell, "-lc", inner]
+    use_py = _use_python_dtach()
+    if use_py:
+        argv = [sys.executable, "-m", "nexus_lite.pty", "--serve", sp, "--", shell, "-lc", inner]
+    else:
+        argv = ["dtach", "-n", sp, "-z", "-r", "winch", shell, "-lc", inner]
 
     try:
         reap_in_background(subprocess.Popen(
@@ -517,6 +758,12 @@ def spawn(
     if not sock_ready:
         raise RuntimeError(f"dtach failed to create socket {sp} within 4 seconds")
 
+    if not use_py:  # the fallback daemon writes its own sidecar
+        mp = _scan_proc(sp) if os.path.isdir("/proc") else _scan_ps(sp)
+        if mp:
+            _write_pid_sidecar(sp, mp)
+    _record_pgid(sp)
+
     # Set initial terminal geometry (240 cols x 45 rows)
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -539,7 +786,7 @@ def spawn(
             break
         time.sleep(0.02)
 
-    mark_session(name, True)  # lite#8: a (re)spawned name is live on the bus registry
+    mark_session(name, True)  # a (re)spawned name is live on the bus registry
     return name
 
 
@@ -700,8 +947,7 @@ def read(name: str, cols: int = CAPTURE_COLS, rows: int = CAPTURE_ROWS, settle: 
 
 _SPIN = list(SPINNERS)
 
-# Per-provider screen markers (pure text; ported from nexus.code
-# core/term/manifests/*.toml, lite's historic markers kept). Keys:
+# Per-provider screen markers (pure text; lite's historic markers kept). Keys:
 #   needs_input: literals for a blocked dialog   busy/busy_re: working markers
 #   idle: literals marking the input prompt      idle_last_line: last line looks
 #   like a shell prompt                          idle_default: not-busy => idle
@@ -767,7 +1013,7 @@ def _has_idle_marker(m: dict, text: str) -> bool:
 
 
 def classify(text: str, provider: str = "") -> str:
-    """Classify rendered screen ``text`` into the nexus.code ``pty_state``
+    """Classify rendered screen ``text`` into a ``pty_state``
     vocabulary: ``"none"`` (blank), ``"needs_input"`` (blocked dialog),
     ``"working"``, or ``"idle"``. Precedence needs_input > working > idle; a
     non-blank screen matching nothing degrades to ``"idle"``, never to
@@ -880,7 +1126,7 @@ def list_sessions() -> list[dict]:
                     os.unlink(sp)
                 except OSError:
                     pass
-                for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark"):
+                for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid"):
                     if os.path.exists(sibling):
                         try:
                             os.unlink(sibling)
@@ -891,23 +1137,210 @@ def list_sessions() -> list[dict]:
     return sessions
 
 
-def kill(name: str) -> bool:
-    """Terminate a dtach session and clean up socket artifacts."""
+def _read_pgid(sock_path: str) -> Optional[int]:
+    try:
+        return int(Path(f"{sock_path}.pgid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def kill_session(name: str) -> list:
+    """Terminate a session: its dtach master and the PTY leader's whole process group (recorded at spawn in
+    <sock>.pgid, so it works even when the master is already gone). Cleans up socket artifacts and returns the pids
+    of that group that still survive (normally [])."""
     sp = sock_path(name)
     pid = find_dtach_master_pid(sp)
+    pgid = _read_pgid(sp) or (_leader_pgid(pid) if pid else None)
     if pid is not None:
         try:
             os.kill(pid, 15)  # SIGTERM
-            time.sleep(0.1)
-            os.kill(pid, 9)   # SIGKILL
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and _pid_alive(pid):
+                time.sleep(0.05)
+            if _pid_alive(pid):
+                os.kill(pid, 9)   # SIGKILL
         except OSError:
             pass
+    leftovers = _kill_group(pgid) if pgid else []
 
-    for path in (sp, f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark"):
+    for path in (sp, f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid"):
         if os.path.exists(path):
             try:
                 os.unlink(path)
             except OSError:
                 pass
-    mark_session(name, False)  # lite#8: killed -> not live on the bus registry
+    mark_session(name, False)  # killed -> not live on the bus registry
+    return leftovers
+
+
+def kill(name: str) -> bool:
+    """Terminate a session and its process group (see kill_session) and clean up socket artifacts."""
+    kill_session(name)
     return True
+
+
+def inject_or_send(
+    name: str,
+    text: Optional[str] = None,
+    *,
+    bus_kind: Optional[str] = None,
+    summary: Optional[str] = None,
+    enter: bool = True,
+    settle_s: float = 1.0,
+    tail_lines: int = 40,
+) -> str:
+    """Drive a live session from outside and return its settled screen tail.
+
+    ``bus_kind`` unset: push raw ``text`` via MSG_PUSH (``send``). ``bus_kind``
+    set: deliver ``text`` (or ``summary``) as a structured bus message to
+    ``name`` via ``mtm.bus_send`` (the session sees the ``[nexus] <kind> ...``
+    pointer line). Then wait ``settle_s`` and return the last ``tail_lines``
+    lines of the pyte-rendered screen (``read``)."""
+    if bus_kind:
+        from .memory import mtm  # lazy: mtm imports this module
+        body = "\n".join(x for x in (summary, text) if x)
+        mtm.bus_send(name, body, kind=bus_kind)
+    elif text is not None:
+        send(name, text, enter=enter)
+    else:
+        raise ValueError("inject_or_send needs text or bus_kind")
+    screen = read(name, settle=settle_s)
+    return "\n".join(screen.splitlines()[-tail_lines:])
+
+
+# ---------------------------------------------------------------------------
+# Stdlib dtach fallback: used when the dtach binary is absent (or
+# NEXUS_LITE_DTACH=python). Speaks the same <BB8s protocol as the client code.
+# ---------------------------------------------------------------------------
+
+def _use_python_dtach() -> bool:
+    return (os.environ.get("NEXUS_LITE_DTACH", "").lower() == "python"
+            or shutil.which("dtach") is None)
+
+
+def _serve(sock: str, argv: list[str]) -> None:
+    """Detach (double-fork), then run ``argv`` in a PTY and serve ``sock``.
+
+    Writes ``<sock>.pid``; exits when the child exits, on SIGTERM, or when
+    ``sock`` is unlinked."""
+    import select
+    import signal
+    import termios
+
+    if os.fork():
+        return
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+
+    pidf = f"{sock}.pid"
+    Path(pidf).write_text(f"{os.getpid()}\n")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(sock)
+        srv.listen(8)
+        st0 = os.stat(sock)
+        ident = (st0.st_dev, st0.st_ino)
+
+        def _same_sock() -> bool:
+            try:
+                st = os.stat(sock)
+            except OSError:
+                return False
+            return (st.st_dev, st.st_ino) == ident
+        child, mfd = os.forkpty()
+        if child == 0:
+            try:
+                os.execvp(argv[0], argv)
+            finally:
+                os._exit(127)
+        fcntl.ioctl(mfd, termios.TIOCSWINSZ, struct.pack("<HHHH", 24, 80, 0, 0))
+
+        def _term(*_a):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, _term)
+
+        clients: dict[socket.socket, list] = {}  # sock -> [attached, inbuf]
+        done = False
+        while not done and _same_sock():
+            rl, _, _ = select.select([srv, mfd, *clients], [], [], 0.5)
+            for r in rl:
+                if r is srv:
+                    c, _ = srv.accept()
+                    c.setblocking(False)
+                    clients[c] = [False, b""]
+                elif r is mfd:
+                    try:
+                        data = os.read(mfd, 65536)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        done = True
+                        break
+                    for c, st in list(clients.items()):
+                        if st[0]:
+                            try:
+                                c.send(data)
+                            except OSError:
+                                pass
+                else:
+                    try:
+                        chunk = r.recv(4096)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        clients.pop(r).clear()
+                        r.close()
+                        continue
+                    st = clients[r]
+                    st[1] += chunk
+                    while len(st[1]) >= _PKT.size:
+                        ptype, ln, payload = _PKT.unpack(st[1][:_PKT.size])
+                        st[1] = st[1][_PKT.size:]
+                        if ptype == MSG_PUSH:
+                            os.write(mfd, payload[:ln])
+                        elif ptype == MSG_ATTACH:
+                            st[0] = True
+                        elif ptype == MSG_DETACH:
+                            st[0] = False
+                        elif ptype == MSG_WINCH:
+                            fcntl.ioctl(mfd, termios.TIOCSWINSZ, payload)
+                            try:
+                                os.killpg(child, signal.SIGWINCH)
+                            except OSError:
+                                pass
+                        elif ptype == MSG_REDRAW:
+                            try:
+                                os.write(mfd, b"\x0c")
+                            except OSError:
+                                pass
+            if not done and os.waitpid(child, os.WNOHANG)[0]:
+                done = True
+    except SystemExit:
+        pass
+    finally:
+        try:
+            os.killpg(child, signal.SIGHUP)
+        except (OSError, NameError, UnboundLocalError):
+            pass
+        try:
+            if _same_sock():
+                os.unlink(sock)
+        except (OSError, NameError, UnboundLocalError):
+            pass
+        try:
+            if Path(pidf).read_text().strip() == str(os.getpid()):
+                os.unlink(pidf)
+        except OSError:
+            pass
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    _args = sys.argv[1:]
+    if len(_args) >= 4 and _args[0] == "--serve" and _args[2] == "--":
+        _serve(_args[1], _args[3:])
+    else:
+        sys.exit("usage: python -m nexus_lite.pty --serve <sock> -- <cmd...>")

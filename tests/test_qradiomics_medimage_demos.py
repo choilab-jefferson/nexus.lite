@@ -5,6 +5,14 @@ including `agy` and `claude` CLI normalization and live agent execution.
 """
 
 import shutil
+
+import os as _os
+
+
+def live_agent_enabled() -> bool:
+    """Live agent tests call the real agy/claude CLI with the user's own login (model calls, cost, sessions recorded
+    in ~/.gemini or ~/.claude that a lab viewer then shows). They run only when asked: NEXUS_LITE_LIVE_AGENT=1."""
+    return _os.environ.get("NEXUS_LITE_LIVE_AGENT") == "1"
 from pathlib import Path
 import pytest
 
@@ -35,9 +43,9 @@ def isolated_demo_env(tmp_path, monkeypatch):
 def test_claude_and_agy_normalization():
     """Verify command normalization for both `agy` and `claude` in pty and oneshot modes."""
     for agent_bin in ("agy", "claude"):
-        assert pty.normalize_agent_cmd(agent_bin, mode="pty") == f"{agent_bin} --dangerously-skip-permissions"
+        assert pty.normalize_agent_cmd(agent_bin, mode="pty", declutter=False) == f"{agent_bin} --dangerously-skip-permissions"
         assert (
-            pty.normalize_agent_cmd(f"{agent_bin} --dangerously-skip-permissions", mode="pty")
+            pty.normalize_agent_cmd(f"{agent_bin} --dangerously-skip-permissions", mode="pty", declutter=False)
             == f"{agent_bin} --dangerously-skip-permissions"
         )
         oneshot = pty.normalize_agent_cmd(agent_bin, mode="oneshot", prompt="analyze dicom")
@@ -137,8 +145,8 @@ def test_cli_demo_subcommand(isolated_demo_env, capsys):
 
 
 @pytest.mark.skipif(
-    shutil.which("agy") is None and shutil.which("claude") is None,
-    reason="Neither agy nor claude binary is installed",
+    (shutil.which("agy") is None and shutil.which("claude") is None) or not live_agent_enabled(),
+    reason="live agent test: needs agy or claude and NEXUS_LITE_LIVE_AGENT=1",
 )
 def test_live_agy_or_claude_hipaa_demo_pipeline(isolated_demo_env):
     """Verify live `agy`/`claude` 3-stage role pipeline on the HIPAA DICOM de-identification demo."""

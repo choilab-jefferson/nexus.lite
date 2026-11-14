@@ -179,7 +179,7 @@ def secrets_env() -> dict:
                 v = userdata.get(k)
             except Exception:  # noqa: BLE001 - secret not set / access not granted
                 v = None
-        else:
+        if not v:
             v = os.environ.get(k)
         if v:
             out[k] = v

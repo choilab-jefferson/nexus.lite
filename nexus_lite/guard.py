@@ -1,6 +1,6 @@
 """Delegation depth / leaf guard primitive.
 
-lite owns this primitive; nexus.code imports it and only extends it. Stdlib only, no daemon. nexus.code adds its own bits on top:
+lite owns this primitive; downstream consumers import it and only extend it. Stdlib only, no daemon. Consumers may add their own bits on top:
 the API single-call exemption (those providers are tools, not agents) and
 ``resolve_role_dispatch`` for mapping a target to a role. Code calls
 ``leaf_guard_error`` after its own exemption check.

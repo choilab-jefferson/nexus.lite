@@ -1,9 +1,17 @@
 # nexus-lite
 
+[![PyPI version](https://img.shields.io/pypi/v/nexus-lite.svg)](https://pypi.org/project/nexus-lite/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 | Interactive Colab Notebook | Description |
 | :--- | :--- |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/nexus_lite_colab_demo.ipynb) | **Core Multi-Agent Demo**: Persistent `dtach` PTYs, message bus pointer injection, swarms, role pipelines, remote tunnel, and live `agy` CLI orchestration |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/qradiomics_medimage_colab_demo.ipynb) | **QRadiomics + MedImage Multi-Agent Demo**: 3D nodule spiculation/AHSN swarm, HIPAA DICOM de-identification pipeline, multi-modality CT/MRI/PET swarm, and Lung1 data-leakage & reproducibility audit |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/v022_primitives_colab.ipynb) | **v0.2.2+ Kernel Primitives**: Memory tiers (`stm`/`mtm`/`ltm`), Bus v1 (`seq`, `bus_ack`/`bus_cursors`, offline redelivery, `bus_prune`), `NEXUS_SENSITIVITY=phi` gate + `stm/1` redaction, and zero-preinstall remote compute (`run_on_colab` / `pack_self_contained_script`) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/loom_multi_agent_colab.ipynb) | `loom` multi-agent build, IBSI Radiomics suite, and zero-preinstall remote compute bundle |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/local_llm_swarm_colab_t4.ipynb) | Free-tier T4 GPU local-LLM swarm (`gemma4:12b` via Ollama, no API keys) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/local_llm_swarm_colab_a100_pro.ipynb) | Colab Pro A100 heterogeneous local-LLM swarm (`qwen3.8:27b` + `gemma4:12b`) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/local_llm_swarm_colab_tiny.ipynb) | CPU / T4 tiny-model 6-agent swarm (`lfm3:1.7b` + `gemma4:e2b`) |
 
 Ultra-simple Colab-ready multi-agent primitives for Nexus.
 
@@ -57,6 +65,13 @@ Ultra-simple Colab-ready multi-agent primitives for Nexus.
 ## Installation & Environments
 
 ```bash
+# Install from PyPI (core kernel)
+pip install nexus-lite
+
+# Or install with scientific demo dependencies (numpy, scipy, pydicom, SimpleITK)
+pip install "nexus-lite[demos]"
+
+# Or install latest main from GitHub
 pip install git+https://github.com/choilab-jefferson/nexus.lite.git
 ```
 
@@ -98,6 +113,8 @@ A pre-configured dev container is included in `.devcontainer/devcontainer.json` 
   `http://127.0.0.1:8765/dashboard?token=<token>&refresh=3`
 
 #### 3. Docker & Local Linux / macOS
+> The `dtach` binary is **optional**: without it (or with `NEXUS_LITE_DTACH=python`) `nexus_lite.pty` uses a built-in stdlib daemon speaking the same wire protocol. Real `dtach` is still preferred when installed.
+
 ```bash
 # Ubuntu / Debian
 sudo apt-get install -y dtach
@@ -178,6 +195,75 @@ tunnel.stop_tunnel()
 
 ---
 
+### Agent teams on the bus
+
+To run several agents (planner, builder, runner) and a human lead as one team over the bus, see
+[skills/nexus-agent-team/SKILL.md](skills/nexus-agent-team/SKILL.md) and run `python examples/agent_team_bus.py`.
+
+### Agreement among agents (`ballot`)
+
+Votes are done by code, not by conversation: agents decide whether to open a ballot, what it asks and how they vote;
+code records the votes, counts them, applies the rule, hashes attached files and announces the result.
+
+```bash
+nexus-lite ballot open b1 --question "adopt report/REPORT_v1.md?" --voters lead,analyst,writer --tie-break lead \
+  --attach report/REPORT_v1.md --notify harness       # opener = $NEXUS_AGENT; every voter gets a message
+nexus-lite ballot cast b1 yes                          # voter = $NEXUS_AGENT; yes or no
+nexus-lite ballot status b1 [--json]                   # recomputed from the bus every time
+```
+
+Rule `majority`: decided yes when yes > n/2, no when yes can no longer reach a majority; with `--tie-break`, a full tie
+follows that voter. The result (`ballot-result`: votes, decision, attachment sha256) goes to the opener and every
+`--notify` target. Records live on the bus under `ballot:<id>`; a record from a non-voter never counts.
+
+Detached jobs, step ledgers and resumable pipelines: [skills/nexus-detached-jobs/SKILL.md](skills/nexus-detached-jobs/SKILL.md).
+
+### Command agents on the bus (`agent run`)
+
+`nexus-lite agent run NAME -- COMMAND [ARGS...]` turns any command into a bus agent: message → command → output → message.
+For each message addressed to `NAME` (FIFO, one at a time) it runs the command once with the UTF-8 body on stdin. Exit 0 +
+non-empty stdout is sent back to the sender; empty stdout sends nothing; stderr is a log and never goes on the bus. On a
+nonzero exit or timeout no stdout is published and, with `--on-failure notify-sender` (default), the sender gets only
+`worker failed: exit=<code>` or `worker failed: timeout` (`silent` sends nothing). The outcome is recorded, then the
+message is acked. There is no exactly-once guarantee: a message that was running when the runner stopped may run again.
+
+```bash
+nexus-lite agent run analyst -- ./my-agent.sh
+nexus-lite agent run analyst --timeout 300 -- python agent.py
+nexus-lite agent run analyst --shell './my-agent.sh | tee output.txt'   # shell only when asked
+```
+
+The command runs without a shell unless `--shell` is given, in its own process group, with an allowlisted env
+(`PATH`, `HOME`, locale, `TMPDIR`, ..., `NEXUS_AGENT=NAME`, `NEXUS_LITE_DIR`; add more with `--env VAR`). SIGTERM/SIGINT/
+SIGHUP stop the runner and kill a running command's group. One runner per name (a second exits with code 75). For scripts and
+tests: `--max-messages N`, `--exit-when-idle`; Python: `nexus_lite.agent_run.agent_run(name, argv, ...)`.
+
+Context between calls: put `{context_in}` / `{context_out}` in the command. Each call gets the current reference
+(`''` when there is none; start with `--context PATH`) and a fresh output path; only a successful call that wrote its
+output promotes it to the next `{context_in}`. The reference is an opaque path; nexus-lite never reads it.
+
+```bash
+nexus-lite agent run analyst -- my-agent --context-in '{context_in}' --context-out '{context_out}'
+```
+
+Loop control and status (volatile: `<ws>/run/agent-NAME.ctl`, nothing stored; no running loop = exit 3). Status is
+the lifecycle only (`starting | idle | busy seq=N | stopped`); results stay in the runner's log.
+
+```bash
+nexus-lite agent status analyst                      # idle
+nexus-lite agent wait analyst --until idle --timeout 60
+nexus-lite agent ctl analyst wake | stop | context set PATH | context reset
+```
+
+Python consumers use the same loop object directly, with a same-process notification instead of polling:
+
+```python
+from nexus_lite.agent_run import AgentLoop
+loop = AgentLoop("analyst", ["my-agent", "--context-in", "{context_in}", "--context-out", "{context_out}"])
+loop.on_status_change(lambda old, new: print(old, "->", new))   # convenience; status() is the truth
+loop.start(); loop.wait(until="idle", timeout=60); loop.set_context("ctx.json"); loop.stop()
+```
+
 ## CLI Reference
 
 > Demo and orchestration subcommands (`demo`, `multi-tier`, `interact`, `cooperate`, `dashboard`) live in the separate `nexus-lite-demo` console script; `nexus-lite` is the kernel CLI only.
@@ -198,6 +284,12 @@ nexus-lite pty kill worker1
 # Message bus (MTM: flow carried across interruptions; transport = bus)
 nexus-lite bus send worker1 "Please review file" --sender orchestrator --kind dm
 nexus-lite bus read --limit 10
+nexus-lite bus read --target worker1 --unacked   # each line: [kind] seq=N <id> <sender> -> <target>: <summary> (body: <file>)
+nexus-lite bus read --target worker1 --unacked --full   # ... and each whole body
+nexus-lite bus ack worker1 N                      # mark everything up to seq N handled
+
+# Command agent: run a command once per message to NAME (see "Command agents on the bus")
+nexus-lite agent run analyst --on-failure notify-sender --timeout 300 -- python agent.py
 
 # Task delegation (worker = leaf agent process; completion arrives as TASK_COMPLETE / TASK_ESCALATE to --caller)
 nexus-lite delegate "python3 worker.py" "Run pipeline" --caller worker1

@@ -11,6 +11,8 @@ import pytest
 
 from nexus_lite.demos import loom_multi_agent as m
 
+ROOT = Path(__file__).resolve().parent.parent
+
 # Fake `loom` binary: behaviour per provider from cfg.json beside it, so every failure
 # mode is injected deterministically. No network, no real loom, no API keys.
 FAKE = r'''#!{py}
@@ -101,9 +103,32 @@ def test_pick_providers_falls_back_to_mock():
 
 
 def test_notebook_has_no_outputs():
-    nb = json.loads(Path("notebooks/loom_multi_agent_colab.ipynb").read_text())
+    nb = json.loads((ROOT / "notebooks" / "loom_multi_agent_colab.ipynb").read_text())
     assert all(not c.get("outputs") and c.get("execution_count") is None
                for c in nb["cells"] if c["cell_type"] == "code")
+
+
+def _fake_userdata(monkeypatch, get):
+    import types
+    g, c, u = (types.ModuleType(n) for n in ("google", "google.colab", "google.colab.userdata"))
+    u.get = get
+    c.userdata, g.colab = u, c
+    for n, mod in (("google", g), ("google.colab", c), ("google.colab.userdata", u)):
+        monkeypatch.setitem(sys.modules, n, mod)
+
+
+def test_secrets_env_falls_back_to_environ_when_userdata_raises(monkeypatch):
+    def boom(k):
+        raise KeyError(k)
+    _fake_userdata(monkeypatch, boom)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k1")
+    assert m.secrets_env()["ANTHROPIC_API_KEY"] == "k1"
+
+
+def test_secrets_env_prefers_userdata_when_set(monkeypatch):
+    _fake_userdata(monkeypatch, lambda k: "from-colab" if k == "ANTHROPIC_API_KEY" else None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+    assert m.secrets_env()["ANTHROPIC_API_KEY"] == "from-colab"
 
 
 def test_secrets_env_reads_env_outside_colab(monkeypatch):
@@ -482,7 +507,7 @@ def test_main_runs_flag_and_injection_banner(tmp_path, capsys):
 def test_example_script_runs_from_checkout_without_pythonpath(tmp_path):
     """Even when an older nexus-lite is installed, the script must use the checkout (or say what to do)."""
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME")}
-    script = os.path.join(os.getcwd(), "examples", "loom_multi_agent.py")
+    script = str(ROOT / "examples" / "loom_multi_agent.py")
     p = subprocess.run([sys.executable, script, "--providers", "mock", "--sandbox", str(tmp_path / "sb"),
                         "--no-baseline"], capture_output=True, text=True, env=env, timeout=120, cwd=tmp_path)
     assert p.returncode == 0, p.stdout + p.stderr

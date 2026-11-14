@@ -5,7 +5,6 @@ Runs on:
   - `local`: isolated zero-install sandbox (`python -I` with packed `nexus_lite` kernel)
   - `colab`: ephemeral or active Google Colab HTTP tunnel (`nexus_lite.colab.tunnel`)
              or standalone zero-install Colab bundle (`--bootstrap-out`)
-  - `hpc`:   SLURM cluster node (`srun` / `sbatch` / `ssh`)
 
 Each run executes the `nexus_lite.loom_multi_agent` suite across all three IBSI
 radiomics tasks (`radiomics-firstorder` [33 hidden tests], `radiomics-texture`
@@ -151,7 +150,7 @@ def run_loom_radiomics_on_compute(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--target", choices=("local", "colab", "hpc", "turing"), default="local")
+    ap.add_argument("--target", choices=("local", "colab"), default="local")
     ap.add_argument("--url", default=None, help="Colab tunnel URL")
     ap.add_argument("--token", default=None, help="Colab tunnel token")
     ap.add_argument("--bootstrap-out", default=None, help="Write standalone zero-install Colab .py bundle")

@@ -15,6 +15,7 @@ from .env import (
     ensure_env,
     sync_dotdir_to_drive,
 )
+from .pc import AgentPC, bind_pc, get_pc, list_pcs, unbind_pc
 from .tunnel import (
     DEFAULT_EXEC_TIMEOUT,
     MAX_BODY_BYTES,
@@ -32,6 +33,11 @@ from .tunnel import (
 )
 
 __all__ = [
+    "AgentPC",
+    "bind_pc",
+    "get_pc",
+    "list_pcs",
+    "unbind_pc",
     "ColabInitResult",
     "colab_sync_from_drive",
     "colab_sync_to_drive",
