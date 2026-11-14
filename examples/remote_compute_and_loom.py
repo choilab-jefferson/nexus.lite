@@ -6,7 +6,7 @@ Runs on:
   - `colab`: ephemeral or active Google Colab HTTP tunnel (`nexus_lite.colab.tunnel`)
              or standalone zero-install Colab bundle (`--bootstrap-out`)
 
-Each run executes the `nexus_lite.loom_multi_agent` suite across all three IBSI
+Each run executes the `nexus_lite.demos.loom_multi_agent` suite across all three IBSI
 radiomics tasks (`radiomics-firstorder` [33 hidden tests], `radiomics-texture`
 [34 hidden tests], `radiomics-stats` [26 hidden tests] = 93 hidden acceptance tests)
 plus the `loom` binary contract probe (`probe()`, `LoomAdapter`, `loom_env()`).
@@ -31,7 +31,7 @@ LOOM_RADIOMICS_WORKLOAD_PYTHON = """
 import json
 import shutil
 from nexus_lite import loom
-from nexus_lite.loom_multi_agent import available_tasks, build
+from nexus_lite.demos.loom_multi_agent import available_tasks, build
 
 # 1. Verify loom adapter & environment contract
 env_sample = loom.loom_env()

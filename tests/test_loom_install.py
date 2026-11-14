@@ -40,7 +40,7 @@ def test_install_ok(monkeypatch, tmp_path):
     out = loom.install_loom(dest=dest)
     assert out == dest and dest.read_bytes() == BIN
     assert os.access(dest, os.X_OK)
-    assert seen[0].startswith("https://github.com/choilab-jefferson/nexus.loom/releases/download/v0.2.2/")
+    assert seen[0].startswith("https://github.com/choilab-jefferson/nexus.loom/releases/download/v0.3.2/")
     assert not list(dest.parent.glob("*.part"))
 
 

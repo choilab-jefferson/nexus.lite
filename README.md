@@ -96,7 +96,7 @@ print(f"Runtime: {info['env']}, Workspace: {info['workspace']}")
 Run in a Colab notebook cell:
 ```python
 !apt-get update -qq && apt-get install -y -qq dtach
-!pip install -q git+https://github.com/choilab-jefferson/nexus.lite.git
+!pip install -qU nexus-lite
 
 import nexus_lite as nl
 from nexus_lite import colab
@@ -118,7 +118,7 @@ A pre-configured dev container is included in `.devcontainer/devcontainer.json` 
 ```bash
 # Ubuntu / Debian
 sudo apt-get install -y dtach
-pip install git+https://github.com/choilab-jefferson/nexus.lite.git
+pip install -U nexus-lite
 ```
 ```python
 import nexus_lite as nl

@@ -24,7 +24,7 @@ Run in a Google Colab notebook cell:
 
 ```python
 !apt-get update -qq && apt-get install -y -qq dtach
-!pip install -q git+https://github.com/choilab-jefferson/nexus.lite.git
+!pip install -qU nexus-lite
 
 from google.colab import drive
 drive.mount("/content/drive")

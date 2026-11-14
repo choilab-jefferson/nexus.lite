@@ -2,6 +2,17 @@
 
 Release notes for nexus-lite. Each GitHub Release uses its version section.
 
+## v0.3.1
+
+### Fixed
+- **Colab Drive FUSE socket fallback**: `pty.default_sock_dir()` now detects Drive FUSE prefixes (`/content/drive`, `/mnt/drive`, `/Volumes/GoogleDrive`) and probes `AF_UNIX` `bind()` capability (`_dir_supports_unix_socket()`), falling back to a private `/tmp/nx-<hash>` directory instead of letting `dtach` fail after 4 seconds on Drive FUSE. `colab.ensure_colab()` also sets `NEXUS_LITE_SOCK_DIR` under `/tmp/nexus-lite-<tag>` when `drive_path` points to a Drive FUSE mount, and `pty.spawn()` now closes its initial WINCH geometry `AF_UNIX` socket via a context manager even when a short-lived session exits immediately.
+- **Notebooks (`nexus_lite_colab_demo.ipynb`, `qradiomics_medimage_colab_demo.ipynb`, `local_llm_swarm_colab_*.ipynb`) & Examples**:
+  - Updated `nexus_lite_colab_demo.ipynb` to install `nexus-lite` directly from PyPI (`!pip install -qU nexus-lite pytest`), keep runtime DB/bus/sockets on local disk via `ensure_colab(gemini_drive_path=..., install_opencode=True)` with `colab.colab_sync_to_drive()` guidance, set `NEXUS_LITE_ALLOW_INSTALL=1` before starting a public `cloudflared` tunnel, fall back cleanly to `run_opencode_free_demo()` when `agy` is unauthenticated, clear inherited `NEXUS_LITE_*` env vars before running `pytest`, and import from `nexus_lite.demos.loom_multi_agent`.
+  - Updated `qradiomics_medimage_colab_demo.ipynb` to install `nexus-lite[demos]`, `pyte>=0.8.1`, and `pytest>=7.0.0` directly from PyPI, skip unauthenticated `agy` cleanly, and use `nexus_lite.demos.loom_multi_agent`.
+  - Updated `examples/make_notebooks.py` (`!pip install -qU nexus-lite`, `mkdir(parents=True, exist_ok=True)`, `ensure_colab(install_opencode=False)`) and regenerated the `local_llm_swarm_colab_{tiny,t4,a100_pro}.ipynb`, `loom_multi_agent_colab.ipynb`, and `v022_primitives_colab.ipynb` notebooks; updated `examples/ollama_agent.py` to honor `OLLAMA_HOST`; updated `examples/remote_compute_and_loom.py` to import `nexus_lite.demos.loom_multi_agent`; updated `examples/loom_multi_agent.py`, `README.md`, and `skills/nexus-colab/SKILL.md` to use PyPI `pip install -U nexus-lite`.
+- **`loom` version & `spic6` phantom demo**: Bumped default `loom.LOOM_VERSION` to `0.3.2` and tuned `demos.scenarios.run_phantom_shape_swarm()` phantom geometry so `soft_benign_nodule` has `0` acute spikes while spiculated and attached cancers separate cleanly under `qradiomics.shape.spiculation_from_voxel` (falling back cleanly to `make(name, size=48)` / skipping `add_soft_spike` when older `qradiomics.shape` builds lack those arguments, and recording `fallback_error` whenever reference geometry fallback triggers).
+- **macOS test portability**: Patched `os.path.isdir("/proc")` in `tests/test_pty_primitive.py::_fake_proc` and scoped `NEXUS_COLAB_REMOTE_TMP` when `/dev/shm` is absent in `tests/test_colab_agent_pc.py::test_pc_reduced_cli_roundtrips`.
+
 ## v0.3.0
 
 ### Added

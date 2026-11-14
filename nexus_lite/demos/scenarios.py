@@ -445,38 +445,56 @@ def run_phantom_shape_swarm(
 
             wdir = Path({str(wdir)!r})
             phantoms_order = [
-                "soft_benign_nodule",
-                "soft_lobulated_nodule",
-                "soft_lung_cancer_spiculated",
-                "soft_juxta_vascular_cancer",
-                "soft_juxta_pleural_cancer",
+                ("soft_benign_nodule", {{"size": 64, "radius": 10.0}}),
+                ("soft_lobulated_nodule", {{"size": 64}}),
+                ("soft_lung_cancer_spiculated", {{"size": 64, "radius": 10.0, "spike_len": 7.0}}),
+                ("soft_juxta_vascular_cancer", {{"size": 64, "radius": 10.0}}),
+                ("soft_juxta_pleural_cancer", {{"size": 64, "radius": 10.0}}),
             ]
             rows = []
+            fallback_error = None
             try:
                 qshape = _load_qshape()
                 make = qshape.make
                 spiculation_from_voxel = qshape.spiculation_from_voxel
                 engine = "qradiomics.shape.spiculation_from_voxel"
-                for name in phantoms_order:
-                    p = make(name, size=48)
+                for name, kw in phantoms_order:
+                    used_legacy = False
+                    try:
+                        p = make(name, **kw)
+                    except TypeError:
+                        # Older qradiomics builds / minimal test stubs only accept (name, size=48).
+                        p = make(name, size=48)
+                        used_legacy = True
+                    mask = p.mask.copy()
+                    if name == "soft_juxta_vascular_cancer" and not used_legacy:
+                        # Add a vascular tether spike along -y where attachment_mask contacts the vessel.
+                        try:
+                            qphantoms = importlib.import_module("qradiomics.shape.phantoms")
+                            center = (kw["size"] / 2.0,) * 3
+                            qphantoms.add_soft_spike(
+                                p.volume.copy(), mask, center, kw["radius"], (0, -1, 0), length=6.0
+                            )
+                        except (ImportError, AttributeError, TypeError):
+                            pass
                     feats, peaks, _, _ = spiculation_from_voxel(
-                        p.mask.astype("float32"),
+                        mask.astype("float32"),
                         spacing=(1.0, 1.0, 1.0),
                         attachment_mask=p.attachment_mask,
-                        n_param_iter=80,
                     )
                     d = feats.as_dict() if hasattr(feats, "as_dict") else dict(feats.__dict__)
                     rows.append({{
                         "phantom": name,
-                        "voxels": int(p.mask.sum()),
+                        "voxels": int(mask.sum()),
                         "spic_Np": float(d.get("Np", 0)),
                         "spic_Na": float(d.get("Na", 0)),
                         "spic_Nl": float(d.get("Nl", 0)),
                         "spic_Na_att": float(d.get("Na_att", 0)),
-                        "spic_s1": round(float(d.get("s1", 0.0)), 4),
+                        "spic_s1": round(abs(float(d.get("s1", 0.0))), 4),
                         "spic_s2": round(float(d.get("s2", 0.0)), 4),
                     }})
-            except Exception:
+            except Exception as exc:
+                fallback_error = f"{{type(exc).__name__}}: {{exc}}"
                 rows = []
                 engine = "reference_geometry_model"
                 reference = [
@@ -498,8 +516,11 @@ def run_phantom_shape_swarm(
                         "spic_s2": s2_v,
                     }})
 
+            payload = {{"engine": engine, "rows": rows}}
+            if fallback_error is not None:
+                payload["fallback_error"] = fallback_error
             out_json = wdir / "spic6_results.json"
-            out_json.write_text(json.dumps({{"engine": engine, "rows": rows}}, indent=2))
+            out_json.write_text(json.dumps(payload, indent=2))
 
             md_lines = [
                 "# 3D Spiculation Benchmark (Choi 2021 CMPB `spic6`)",
@@ -549,6 +570,7 @@ def run_phantom_shape_swarm(
 
             wdir = Path({str(wdir)!r})
             summary = []
+            fallback_error = None
             try:
                 qshape = _load_qshape()
                 AHSNConfig = qshape.AHSNConfig
@@ -573,7 +595,8 @@ def run_phantom_shape_swarm(
                         "mask_voxels_before_wall_elim": int(p.mask.sum()),
                         "mask_voxels_after_wall_elim": int(cleaned_mask.sum()),
                     }})
-            except Exception:
+            except Exception as exc:
+                fallback_error = f"{{type(exc).__name__}}: {{exc}}"
                 engine = "reference_ahsn_model"
                 summary = [
                     {{"phantom": "soft_benign_nodule", "ahsn_dims": 180, "ahsn_l2_norm": 1.0, "ahsn_entropy": 4.1205, "mask_voxels_before_wall_elim": 905, "mask_voxels_after_wall_elim": 905}},
@@ -581,7 +604,10 @@ def run_phantom_shape_swarm(
                     {{"phantom": "soft_juxta_pleural_cancer", "ahsn_dims": 180, "ahsn_l2_norm": 1.0, "ahsn_entropy": 5.6190, "mask_voxels_before_wall_elim": 4395, "mask_voxels_after_wall_elim": 4120}},
                 ]
 
-            (wdir / "ahsn_results.json").write_text(json.dumps({{"engine": engine, "summary": summary}}, indent=2))
+            payload = {{"engine": engine, "summary": summary}}
+            if fallback_error is not None:
+                payload["fallback_error"] = fallback_error
+            (wdir / "ahsn_results.json").write_text(json.dumps(payload, indent=2))
             md_lines = [
                 "# 180-D AHSN & Pleural Wall Elimination (Choi 2014 CMPB)",
                 f"- **Engine**: `{{engine}}`",

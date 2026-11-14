@@ -261,9 +261,79 @@ def test_qshape_loader_bypasses_broken_pydantic_init(isolated_demo_env, tmp_path
     assert "rows" in res["spic6"]
     assert len(res["spic6"]["rows"]) == 5
     assert res["spic6"]["engine"] == "qradiomics.shape.spiculation_from_voxel"
+    assert "fallback_error" not in res["spic6"]
     assert "summary" in res["ahsn"]
     assert len(res["ahsn"]["summary"]) == 3
     assert res["ahsn"]["engine"] == "qradiomics.shape.ahsn"
+    assert "fallback_error" not in res["ahsn"]
+
+
+def test_phantom_swarm_legacy_signature_and_fallback_error(isolated_demo_env, tmp_path, monkeypatch):
+    """Verify legacy make(name, size=48) without phantoms works and errors are recorded on fallback."""
+    legacy_site = tmp_path / "legacy_site"
+    qr_shape = legacy_site / "qradiomics" / "shape"
+    qr_shape.mkdir(parents=True)
+    (legacy_site / "qradiomics" / "__init__.py").write_text("", encoding="utf-8")
+    (qr_shape / "__init__.py").write_text(
+        "import numpy as np\n"
+        "class AHSNConfig:\n"
+        "    pass\n"
+        "class _Phantom:\n"
+        "    def __init__(self):\n"
+        "        self.volume = np.zeros((16, 16, 16), dtype='float32')\n"
+        "        self.mask = np.ones((16, 16, 16), dtype=bool)\n"
+        "        self.attachment_mask = np.zeros((16, 16, 16), dtype=bool)\n"
+        "class _SpicFeats:\n"
+        "    def as_dict(self):\n"
+        "        return {'Np': 1.0, 'Na': 1.0, 'Nl': 0.0, 'Na_att': 0.0, 's1': 0.1, 's2': 0.05}\n"
+        "def make(name, size=48):\n"
+        "    return _Phantom()\n"
+        "def spiculation_from_voxel(mask, spacing=(1.0, 1.0, 1.0), attachment_mask=None, n_param_iter=80):\n"
+        "    return _SpicFeats(), None, None, None\n"
+        "def ahsn(volume, mask=None, cfg=None):\n"
+        "    return np.ones(180, dtype='float32') / 180.0\n"
+        "def wall_eliminate(volume, cfg=None, area_threshold=40):\n"
+        "    return volume, np.ones_like(volume, dtype=bool)\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("PYTHONPATH", str(legacy_site))
+    res_legacy = scenarios.run_phantom_shape_swarm(agent="python")
+    assert res_legacy["spic6"]["engine"] == "qradiomics.shape.spiculation_from_voxel"
+    assert "fallback_error" not in res_legacy["spic6"]
+    assert res_legacy["ahsn"]["engine"] == "qradiomics.shape.ahsn"
+    assert "fallback_error" not in res_legacy["ahsn"]
+
+    failing_site = tmp_path / "failing_site"
+    fail_shape = failing_site / "qradiomics" / "shape"
+    fail_shape.mkdir(parents=True)
+    (failing_site / "qradiomics" / "__init__.py").write_text("", encoding="utf-8")
+    (fail_shape / "__init__.py").write_text(
+        "class AHSNConfig:\n"
+        "    pass\n"
+        "class _Phantom:\n"
+        "    def __init__(self):\n"
+        "        import numpy as np\n"
+        "        self.volume = np.zeros((8, 8, 8), dtype='float32')\n"
+        "        self.mask = np.ones((8, 8, 8), dtype=bool)\n"
+        "        self.attachment_mask = np.zeros((8, 8, 8), dtype=bool)\n"
+        "def make(name, size=48):\n"
+        "    return _Phantom()\n"
+        "def spiculation_from_voxel(*args, **kwargs):\n"
+        "    raise RuntimeError('spic6 kernel failure')\n"
+        "def ahsn(*args, **kwargs):\n"
+        "    raise RuntimeError('ahsn kernel failure')\n"
+        "def wall_eliminate(*args, **kwargs):\n"
+        "    raise RuntimeError('unused')\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("PYTHONPATH", str(failing_site))
+    res_fail = scenarios.run_phantom_shape_swarm(agent="python")
+    assert res_fail["spic6"]["engine"] == "reference_geometry_model"
+    assert res_fail["spic6"]["fallback_error"] == "RuntimeError: spic6 kernel failure"
+    assert res_fail["ahsn"]["engine"] == "reference_ahsn_model"
+    assert res_fail["ahsn"]["fallback_error"] == "RuntimeError: ahsn kernel failure"
 
 
 def test_opencode_normalization_and_free_demo(isolated_demo_env, monkeypatch):

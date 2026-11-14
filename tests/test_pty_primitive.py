@@ -11,6 +11,8 @@ SOCK = "/tmp/x.sock"
 
 def _fake_proc(monkeypatch, procs):
     """procs: {pid: (argv, children_str)}"""
+    real_isdir = P.os.path.isdir
+    monkeypatch.setattr(P.os.path, "isdir", lambda p: True if str(p) == "/proc" else real_isdir(p))
     monkeypatch.setattr(P.glob, "glob", lambda pat: [f"/proc/{p}/cmdline" for p in procs])
     real_open = builtins.open
 

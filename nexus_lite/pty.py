@@ -169,14 +169,70 @@ winch_packet = _winch_packet
 
 SUN_PATH_MAX = 103   # macOS sun_path is 104 bytes with the NUL (Linux 108)
 SOCK_NAME_BUDGET = 40  # session-name bytes the default directory must leave room for
+_DRIVE_FUSE_PREFIXES = ("/content/drive", "/mnt/drive", "/Volumes/GoogleDrive")
+_SOCK_DIR_CAPABLE: dict[str, bool] = {}
+
+
+def _on_drive_fuse(path: Union[str, Path]) -> bool:
+    """Return True if path resides on a Drive FUSE mount where AF_UNIX bind() is unsupported."""
+    raw = str(path)
+    candidates = [raw]
+    with contextlib.suppress(OSError):
+        resolved = str(Path(path).resolve())
+        if resolved != raw:
+            candidates.append(resolved)
+    for cand in candidates:
+        for prefix in _DRIVE_FUSE_PREFIXES:
+            if cand == prefix or cand.startswith(prefix + "/"):
+                return True
+    return False
+
+
+def _dir_supports_unix_socket(d: str) -> bool:
+    """Probe whether directory `d` (or its closest existing parent) can bind an AF_UNIX socket."""
+    if d in _SOCK_DIR_CAPABLE:
+        return _SOCK_DIR_CAPABLE[d]
+    probe_dir = d
+    while probe_dir and not os.path.isdir(probe_dir):
+        parent = os.path.dirname(probe_dir)
+        if parent == probe_dir:
+            break
+        probe_dir = parent
+    if not probe_dir or not os.path.isdir(probe_dir):
+        return False
+    probe_sock = os.path.join(probe_dir, f".nx-p-{os.getpid()}-{threading.get_ident() % 100000}")
+    if len(probe_sock.encode()) > SUN_PATH_MAX:
+        probe_sock = os.path.join(probe_dir, f".nxp-{os.getpid()}")
+    ok = False
+    sock: Optional[socket.socket] = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(probe_sock)
+        sock.bind(probe_sock)
+        ok = True
+    except OSError:
+        ok = False
+    finally:
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.close()
+        with contextlib.suppress(OSError):
+            os.unlink(probe_sock)
+    _SOCK_DIR_CAPABLE[d] = ok
+    return ok
 
 
 def default_sock_dir() -> str:
-    """Workspace-scoped runtime socket dir: <ws>/run, or /tmp/nx-<workspace hash> when <ws>/run leaves too little
-    room for a socket name. Never a plain shared /tmp; the hash only separates namespaces (not a secret)."""
+    """Workspace-scoped runtime socket dir: <ws>/run when local, short, and AF_UNIX-capable;
+    or /tmp/nx-<workspace hash> otherwise. Never a plain shared /tmp; the hash only separates namespaces."""
     ws = get_workspace()
     run = str(ws / "run")
-    if len(run.encode()) + len("/nexus-lite-.sock") + SOCK_NAME_BUDGET <= SUN_PATH_MAX:
+    if (
+        not _on_drive_fuse(ws)
+        and len(run.encode()) + len("/nexus-lite-.sock") + SOCK_NAME_BUDGET <= SUN_PATH_MAX
+        and _dir_supports_unix_socket(run)
+    ):
         return run
     return "/tmp/nx-" + hashlib.sha256(str(ws).encode()).hexdigest()[:12]
 
@@ -766,13 +822,12 @@ def spawn(
 
     # Set initial terminal geometry (240 cols x 45 rows)
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(1.0)
-        s.connect(sp)
-        s.sendall(_packet(MSG_ATTACH))
-        s.sendall(_winch_packet(CAPTURE_ROWS, CAPTURE_COLS))
-        s.sendall(_packet(MSG_DETACH))
-        s.close()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(sp)
+            s.sendall(_packet(MSG_ATTACH))
+            s.sendall(_winch_packet(CAPTURE_ROWS, CAPTURE_COLS))
+            s.sendall(_packet(MSG_DETACH))
     except Exception:
         pass
 

@@ -524,8 +524,10 @@ def test_tighten_colab_cli_perms(tmp_path, monkeypatch):
     assert (hist.stat().st_mode & 0o777) == 0o700
 
 
-def test_pc_reduced_cli_roundtrips(fakecolab):
+def test_pc_reduced_cli_roundtrips(fakecolab, monkeypatch):
     """P3: runtime reuse skips the probe; run() = 1 upload(spec) + 1 exec."""
+    if not os.path.isdir("/dev/shm"):
+        monkeypatch.setenv(tunnel.REMOTE_TMP_ENV, str(fakecolab["tmp"]))
     pcmod.bind_pc("physicist", remote_home=str(fakecolab["tmp"] / "pchome"))
     pc = pcmod.get_pc("physicist")
     pc.ensure_runtime()

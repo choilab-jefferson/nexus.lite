@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 # Pinned released loom binary. Nothing here downloads anything:
 # install_loom() is the only network path and runs only when called explicitly.
-LOOM_VERSION = "0.2.2"
+LOOM_VERSION = "0.3.2"
 LOOM_RELEASE_BASE = "https://github.com/choilab-jefferson/nexus.loom/releases/download/v{version}"
 # Optional env override of the release base URL (directory holding the assets).
 LOOM_INSTALL_URL = os.environ.get("LOOM_INSTALL_URL")

@@ -105,3 +105,42 @@ def test_two_workspaces_same_agent_name_are_isolated(monkeypatch, short_ws):
         for w in (a, b):
             use_ws(monkeypatch, w)
             pty.kill("worker")
+
+
+def test_drive_fuse_workspace_falls_back_to_hashed_tmp_dir(monkeypatch):
+    for prefix in ("/content/drive/ws", "/mnt/drive/ws", "/Volumes/GoogleDrive/ws"):
+        use_ws(monkeypatch, Path(prefix))
+        want = "/tmp/nx-" + hashlib.sha256(prefix.encode()).hexdigest()[:12]
+        assert pty.default_sock_dir() == want
+        assert pty._on_drive_fuse(prefix) is True
+
+
+def test_af_unix_eopnotsupp_falls_back_to_hashed_tmp_dir(monkeypatch, short_ws):
+    import errno
+    import socket as real_socket
+
+    w = short_ws()
+    use_ws(monkeypatch, w)
+    pty._SOCK_DIR_CAPABLE.pop(str(w / "run"), None)
+
+    class _NoUnixSock:
+        def bind(self, _addr):
+            raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+        def close(self):
+            pass
+
+    class _FakeSockMod:
+        AF_UNIX = real_socket.AF_UNIX
+        SOCK_STREAM = real_socket.SOCK_STREAM
+
+        @staticmethod
+        def socket(*_a, **_k):
+            return _NoUnixSock()
+
+    monkeypatch.setattr(pty, "socket", _FakeSockMod)
+    try:
+        want = "/tmp/nx-" + hashlib.sha256(str(w).encode()).hexdigest()[:12]
+        assert pty.default_sock_dir() == want
+    finally:
+        pty._SOCK_DIR_CAPABLE.pop(str(w / "run"), None)

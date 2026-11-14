@@ -16,6 +16,6 @@ try:
 except ImportError as e:
     sys.exit("nexus_lite.demos.loom_multi_agent is missing (%s): the installed nexus-lite is too old.\n"
              "Run `pip install -e .` from a checkout of nexus.lite, or "
-             "`pip install -U git+https://github.com/choilab-jefferson/nexus.lite.git`." % e)
+             "`pip install -U nexus-lite`." % e)
 
 sys.exit(main())

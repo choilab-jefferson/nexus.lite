@@ -13,7 +13,7 @@ def build(title, gpu, env_note, models, env_vars, hetero, tiny=False):
     cells = [
         md(f"# {title}\n\nRuntime → **{gpu}**. {env_note}\nRuns Ollama on the Colab GPU and drives a parallel swarm + sequential pipeline of *local* model agents via `nexus_lite.run_swarm` / `run_pipeline`. No API keys."),
         md("## 1. GPU check + install"),
-        code("!nvidia-smi --query-gpu=name,memory.total --format=csv\n!apt-get update -qq && apt-get install -y -qq dtach zstd\n!pip install -q git+https://github.com/choilab-jefferson/nexus.lite.git\n!curl -fsSL https://ollama.com/install.sh | sh"),
+        code("!nvidia-smi --query-gpu=name,memory.total --format=csv\n!apt-get update -qq && apt-get install -y -qq dtach zstd\n!pip install -qU nexus-lite\n!curl -fsSL https://ollama.com/install.sh | sh"),
         md("## 2. Start Ollama (GPU) and pull model(s)"),
         code("import subprocess, time, urllib.request, os\n"
              f"MODELS = {models!r}\nMODEL = MODELS[0]\n"
@@ -23,7 +23,7 @@ def build(title, gpu, env_note, models, env_vars, hetero, tiny=False):
              "for m in MODELS:\n    subprocess.run(['ollama', 'pull', m], check=True)\n"
              "!ollama list"),
         md("## 3. Agent wrapper\n`run_swarm` feeds each spec's `prompt` to its `cmd` on **stdin**; this helper (also `examples/ollama_agent.py`) forwards it to the local model."),
-        code("import pathlib\npathlib.Path('/content/nexus-agents').mkdir(exist_ok=True)\n"
+        code("import pathlib\npathlib.Path('/content/nexus-agents').mkdir(parents=True, exist_ok=True)\n"
              f"pathlib.Path('/content/nexus-agents/ollama_agent.py').write_text({HELPER!r})\n"
              "def agent(system, model=None):\n"
              "    return f'python3 /content/nexus-agents/ollama_agent.py --model {model or MODEL} --system \"{system}\"'\n"
@@ -38,7 +38,7 @@ def build(title, gpu, env_note, models, env_vars, hetero, tiny=False):
         body = "".join(f"  {{'task_id': {t!r}, 'cmd': agent('You are a {r}. Be concise.', MODELS[{i % 2}]), 'prompt': f'List 3 {w} for {{topic}}.'}},\n" for i, (t, r, w) in enumerate(roles))
         cells += [
             md("## 4. Tiny-model swarm: 6 agents, 2 tiny models, one GPU (or CPU)\nAgents alternate between `" + models[0] + "` and `" + models[1] + "`; all 6 run concurrently."),
-            code("import nexus_lite as nl\nfrom nexus_lite import colab\nfrom nexus_lite.demos import viz\ncolab.ensure_colab()\ntopic = 'a REST API for a todo-list service'\nspecs = [\n" + body + "]\nt0 = time.time()\nresults = nl.run_swarm(specs, caller='orchestrator', timeout=900.0)\nprint(f'6-agent swarm finished in {time.time()-t0:.1f}s')\nfor r in results: print(f\"\\n[{r['status'].upper()}] {r['task_id']}\\n{r['output'].strip()}\")"),
+            code("import nexus_lite as nl\nfrom nexus_lite import colab\nfrom nexus_lite.demos import viz\ncolab.ensure_colab(install_opencode=False)\ntopic = 'a REST API for a todo-list service'\nspecs = [\n" + body + "]\nt0 = time.time()\nresults = nl.run_swarm(specs, caller='orchestrator', timeout=900.0)\nprint(f'6-agent swarm finished in {time.time()-t0:.1f}s')\nfor r in results: print(f\"\\n[{r['status'].upper()}] {r['task_id']}\\n{r['output'].strip()}\")"),
         ]
         cells += [
             md("## 5. Sequential pipeline: driver → verifier → documenter"),
@@ -49,7 +49,7 @@ def build(title, gpu, env_note, models, env_vars, hetero, tiny=False):
         return {"cells": cells, "metadata": {"language_info": {"name": "python"}, "colab": {"provenance": [], "gpuType": "T4"}, "accelerator": "GPU", "kernelspec": {"name": "python3", "display_name": "Python 3"}}, "nbformat": 4, "nbformat_minor": 5}
     cells += [
         md("## 4. Parallel swarm: 3 local agents on one GPU" + (f"\nHeterogeneous: the security reviewer runs on `{m2}`, the others on `{main}` (both stay resident in VRAM)." if hetero else "\nOllama queues requests, so the workers share the GPU.")),
-        code("import nexus_lite as nl\nfrom nexus_lite import colab\nfrom nexus_lite.demos import viz\ncolab.ensure_colab()\ntopic = 'a REST API for a todo-list service'\n"
+        code("import nexus_lite as nl\nfrom nexus_lite import colab\nfrom nexus_lite.demos import viz\ncolab.ensure_colab(install_opencode=False)\ntopic = 'a REST API for a todo-list service'\n"
              "specs = [\n"
              f"  {{'task_id': 'arch',  'cmd': agent('You are a software architect. Be concise.', {sw_models[0]}), 'prompt': f'List 4 key design decisions for {{topic}}.'}},\n"
              f"  {{'task_id': 'sec',   'cmd': agent('You are a security reviewer. Be concise.', {sw_models[1]}),  'prompt': f'List 4 security risks for {{topic}}.'}},\n"
@@ -101,7 +101,7 @@ def loom_multi_agent_nb():
            "With no key the offline mock path runs: loom's mock provider cannot call tools, so the harness writes scripted file "
            "payloads (two flawed modules fixed in round 2). Mock numbers are scripted, not evidence about any model."),
         md("## 1. Install nexus-lite"),
-        code("!pip install -q git+https://github.com/choilab-jefferson/nexus.lite.git pytest"),
+        code("!pip install -qU nexus-lite pytest"),
         md("## 2. Install and probe the `loom` binary\n"
            "Installing loom is an explicit step: `install_loom()` downloads the pinned release binary and verifies its sha256. "
            "Then `nexus_lite.loom.probe()` verifies the CLI capabilities and exit-code contract."),
@@ -165,7 +165,7 @@ def v022_primitives_nb():
            "(2) the `NEXUS_SENSITIVITY=phi` gate with `stm/1` redaction, (3) zero-preinstall remote compute "
            "(`pack_self_contained_script` / `run_on_colab`) over a local loopback tunnel. No GPU, no API keys."),
         md("## 1. Install"),
-        code("!pip install -q git+https://github.com/choilab-jefferson/nexus.lite.git"),
+        code("!pip install -qU nexus-lite"),
         md("## 2. Memory tiers: STM, MTM, LTM\n"
            "Everything lives in an isolated scratch workspace (`NEXUS_LITE_DIR`). MTM flow checkpoints are bus messages of "
            "`kind='checkpoint'`; the bus is the MTM transport."),

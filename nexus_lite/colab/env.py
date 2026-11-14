@@ -211,6 +211,13 @@ def ensure_colab(
         persistent_dir = Path(drive_path).resolve()
         os.environ["NEXUS_LITE_HOME"] = str(persistent_dir)
         os.environ["NEXUS_LITE_DIR"] = str(persistent_dir)
+        # Sockets cannot bind() on Google Drive FUSE mounts even when drive_path is explicitly requested.
+        from nexus_lite.pty import _on_drive_fuse
+        if not os.environ.get("NEXUS_LITE_SOCK_DIR") and (
+            _on_drive_fuse(drive_path) or _on_drive_fuse(persistent_dir)
+        ):
+            tag = hashlib.sha256(str(persistent_dir).encode()).hexdigest()[:8]
+            os.environ["NEXUS_LITE_SOCK_DIR"] = f"/tmp/nexus-lite-{tag}"
     elif mount_drive and os.path.exists("/content/drive/MyDrive"):
         # DB, sockets and bus stay on local disk (Drive FUSE: unreliable locks, long paths);
         # Drive is only the artifact store, reached via colab_sync_to_drive/colab_sync_from_drive.
