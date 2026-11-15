@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-lite"
-version = "0.3.1"
+version = "0.3.2"
 description = "Ultra-simple Colab-ready multi-agent primitives for Nexus"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,9 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = [
-    "pyte>=0.8.1",
-]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/choilab-jefferson/nexus.lite"
@@ -33,6 +31,8 @@ Changelog = "https://github.com/choilab-jefferson/nexus.lite/blob/main/CHANGELOG
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "pyte>=0.8.1",  # golden-fixture generation and parity checks only (scripts/make_pty_goldens.py); never imported at runtime
+    "wcwidth>=0.2",
 ]
 mlflow = [
     "mlflow-skinny>=2.10",
@@ -52,4 +52,4 @@ nexus-lite-colab = "nexus_lite.colab.tunnel:main"
 nexus-lite-demo = "nexus_lite.demos.cli:main"
 
 [tool.setuptools]
-packages = ["nexus_lite", "nexus_lite.colab", "nexus_lite.demos", "nexus_lite.memory"]
+packages = ["nexus_lite", "nexus_lite.colab", "nexus_lite.demos", "nexus_lite.memory", "nexus_lite.pty"]

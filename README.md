@@ -5,9 +5,9 @@
 
 | Interactive Colab Notebook | Description |
 | :--- | :--- |
-| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/nexus_lite_colab_demo.ipynb) | **Core Multi-Agent Demo**: Persistent `dtach` PTYs, message bus pointer injection, swarms, role pipelines, remote tunnel, and live `agy` CLI orchestration |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/nexus_lite_colab_demo.ipynb) | **Core Multi-Agent Demo**: Persistent PTYs, message bus pointer injection, swarms, role pipelines, remote tunnel, and live `agy` CLI orchestration |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/qradiomics_medimage_colab_demo.ipynb) | **QRadiomics + MedImage Multi-Agent Demo**: 3D nodule spiculation/AHSN swarm, HIPAA DICOM de-identification pipeline, multi-modality CT/MRI/PET swarm, and Lung1 data-leakage & reproducibility audit |
-| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/v022_primitives_colab.ipynb) | **v0.2.2+ Kernel Primitives**: Memory tiers (`stm`/`mtm`/`ltm`), Bus v1 (`seq`, `bus_ack`/`bus_cursors`, offline redelivery, `bus_prune`), `NEXUS_SENSITIVITY=phi` gate + `stm/1` redaction, and zero-preinstall remote compute (`run_on_colab` / `pack_self_contained_script`) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/kernel_primitives_colab.ipynb) | **Kernel Primitives**: 3-tier memory (`stm`/`mtm`/`ltm`), Bus v3 multi-consumer cursors (`seq`, `consumer=`, `bus_ack`, offline redelivery, `bus_prune`), stdlib PTY sessions (`nexus_lite.pty`), code-tallied `ballot` voting, `cas` + `#nexus.ledger/2` step ledgers, `NEXUS_SENSITIVITY=phi` gate, and zero-preinstall remote compute (`run_local_sandbox` / `run_on_colab`) |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/loom_multi_agent_colab.ipynb) | `loom` multi-agent build, IBSI Radiomics suite, and zero-preinstall remote compute bundle |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/local_llm_swarm_colab_t4.ipynb) | Free-tier T4 GPU local-LLM swarm (`gemma4:12b` via Ollama, no API keys) |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/choilab-jefferson/nexus.lite/blob/main/notebooks/local_llm_swarm_colab_a100_pro.ipynb) | Colab Pro A100 heterogeneous local-LLM swarm (`qwen3.8:27b` + `gemma4:12b`) |
@@ -15,15 +15,15 @@
 
 Ultra-simple Colab-ready multi-agent primitives for Nexus.
 
-`nexus-lite` turns standalone **CLI coding agents** (an *agent* here is a CLI such as `agy`, `opencode` or `claude`; a *worker* is the leaf agent process a `delegate` call starts) (`agy`, `opencode`, and `claude`) into a coordinated multi-agent system—providing persistent PTY control (`dtach` + `pyte`), inter-agent messaging with PTY pointer delivery (`[nexus] dm`), native `stm/1` short-term memory (`<nexus_stm>`), parallel swarm & role-pipeline delegation, 5-turn peer-to-peer A2A review loops (`interact`), autonomous 5-phase cooperative problem-solving swarms (`cooperate`), and a local Markdown wiki with full-text search (FTS5). Unlike prompt-chaining API libraries, `nexus-lite` orchestrates real coding agents with full shell and filesystem access while requiring **no external server daemons and zero infrastructure setup**, making it ideal for Google Colab, Jupyter notebooks, and lightweight research workflows.
+`nexus-lite` turns standalone **CLI coding agents** (an *agent* here is a CLI such as `agy`, `opencode` or `claude`; a *worker* is the leaf agent process a `delegate` call starts) (`agy`, `opencode`, and `claude`) into a coordinated multi-agent system—providing persistent PTY control (built-in stdlib PTY server speaking the `dtach` wire protocol + `pyte`), inter-agent messaging with PTY pointer delivery (`[nexus] dm`), native `stm/1` short-term memory (`<nexus_stm>`), parallel swarm & role-pipeline delegation, 5-turn peer-to-peer A2A review loops (`interact`), autonomous 5-phase cooperative problem-solving swarms (`cooperate`), and a local Markdown wiki with full-text search (FTS5). Unlike prompt-chaining API libraries, `nexus-lite` orchestrates real coding agents with full shell and filesystem access while requiring **no external server daemons and zero infrastructure setup**, making it ideal for Google Colab, Jupyter notebooks, and lightweight research workflows.
 
 - **Multi-Agent CLI Harness & Automatic Quota Fallback (`agy` + `opencode` + `claude`)**: Orchestrate heavy reasoning, adversarial `pytest` authoring, and closed-loop repair across **`agy`** (Google Antigravity CLI), **`opencode`** (`opencode/mimo-v2.6-flash-free`, `opencode/mimo-v2.6-flash-free`, `opencode/big-pickle`—which work out-of-the-box with **zero signup and zero API key**), and **`claude`** (Claude Code). If `claude` hits its weekly limit or `opencode` hits its daily free-tier limit, `nexus-lite` automatically falls back in-place (`fallback_cmd`) to available agents.
 
 ## Features
 
 1. **Persistent PTY Controller (`nexus_lite.pty`)**:
-   - Native `dtach` wire protocol client (`MSG_PUSH`, `MSG_ATTACH`, `MSG_DETACH`, `MSG_WINCH`).
-   - Terminal screen capture and VT rendering via `pyte`.
+   - Dependency-free PTY package `nexus_lite.pty`: session server (`python -m nexus_lite.pty serve [-A|-c|-N|-z] SOCK -- CMD...`, stdlib only, no `dtach` binary), clients (interactive attach and a programmatic `Connection`) over the `dtach` 0.9 wire protocol (`MSG_PUSH`, `MSG_ATTACH`, `MSG_DETACH`, `MSG_WINCH`, `MSG_REDRAW`), the control API (`spawn`, `send`, `keys`, `read`, `wait`, `kill`) and a screen reader; `nexus-lite pty ls` lists sessions and `nexus-lite pty attach [name|no] [--ro]` attaches a terminal (numbered picker without a name; Ctrl-\ detaches).
+   - Terminal screen capture with the stdlib VT text-screen reader `nexus_lite.pty.screen` (no third-party emulator; subclass `Screen` to extend it).
    - Concurrency safety with `flock` on `{sock}.lock`.
    - Multi-agent busy/idle classifier (`claude`, `agy`, `gemini`, `copilot`, `opencode`, `bash`).
    - Keystroke injection (`keys`) and automated wait loops (`wait`).
@@ -48,7 +48,7 @@ Ultra-simple Colab-ready multi-agent primitives for Nexus.
 
 6. **Universal Environment Support (`ensure_env`, `detect_env`, `ensure_colab`)**:
    - Universal runtime detection: Google Colab, VS Code Dev Containers, GitHub Codespaces, Docker, RunPod/Vast.ai, or Local Linux/macOS.
-   - One-call `ensure_env()` bootstraps `dtach` and initializes the `.nexus/` workspace.
+   - One-call `ensure_env()` initializes the `.nexus/` workspace.
    - Ready-to-use `.devcontainer/devcontainer.json` configuration with automatic port forwarding.
 
 7. **Cloudflared Remote Tunnel (`nexus_lite.colab.tunnel`)**:
@@ -95,7 +95,6 @@ print(f"Runtime: {info['env']}, Workspace: {info['workspace']}")
 #### 1. Google Colab
 Run in a Colab notebook cell:
 ```python
-!apt-get update -qq && apt-get install -y -qq dtach
 !pip install -qU nexus-lite
 
 import nexus_lite as nl
@@ -106,18 +105,16 @@ info = colab.ensure_env()  # Auto-detects Colab, defaults mount_drive=True, star
 ```
 
 #### 2. VS Code Dev Containers & GitHub Codespaces
-A pre-configured dev container is included in `.devcontainer/devcontainer.json` (`python:3.12` base image, `dtach` system package, `pip install -e .[dev]`, and port 8765 auto-forwarding).
+A pre-configured dev container is included in `.devcontainer/devcontainer.json` (`python:3.12` base image, `pip install -e .[dev]`, and port 8765 auto-forwarding).
 - Open the repository in VS Code using **Dev Containers: Reopen in Container** or launch in **GitHub Codespaces**.
 - Call `colab.ensure_env()`. Port `8765` is forwarded automatically.
 - Open the compact 2x2 live dashboard in your browser:
   `http://127.0.0.1:8765/dashboard?token=<token>&refresh=3`
 
 #### 3. Docker & Local Linux / macOS
-> The `dtach` binary is **optional**: without it (or with `NEXUS_LITE_DTACH=python`) `nexus_lite.pty` uses a built-in stdlib daemon speaking the same wire protocol. Real `dtach` is still preferred when installed.
+> No `dtach` binary is needed: PTY sessions are served by the built-in stdlib server (`python -m nexus_lite.pty serve [-r winch] SOCK -- CMD...`; `nexus_lite.ptyd` stays as a compatibility shim for one release), which speaks the `dtach` 0.9 wire protocol, so `dtach` clients can still attach. `-A` attaches or creates (stale-socket safe), `-c` creates and attaches, `-N` runs in the foreground and exits with the program's exit code, `-z` is accepted. `NEXUS_LITE_DTACH=binary` opts back into an installed `dtach` binary. Specification: `docs/specs/pty-package.md`.
 
 ```bash
-# Ubuntu / Debian
-sudo apt-get install -y dtach
 pip install -U nexus-lite
 ```
 ```python
@@ -272,13 +269,14 @@ loop.start(); loop.wait(until="idle", timeout=60); loop.set_context("ctx.json");
 # Initialize workspace (.nexus/)
 nexus-lite init [--workspace .nexus]
 
-# Manage PTY sessions (a session = one dtach PTY / registry row; never a worker)
+# Manage PTY sessions (a session = one persistent PTY / registry row; never a worker)
 nexus-lite pty new "bash" --name worker1
 nexus-lite pty list
 nexus-lite pty send worker1 "ls -la"
 nexus-lite pty keys worker1 enter
 nexus-lite pty read worker1 --cols 160 --rows 45
 nexus-lite pty wait worker1 --provider bash --timeout 10
+nexus-lite pty attach worker1   # interactive; Ctrl-\ detaches, the session keeps running
 nexus-lite pty kill worker1
 
 # Message bus (MTM: flow carried across interruptions; transport = bus)
@@ -398,7 +396,7 @@ Words below are lite names; the right column is the matching nexus word. Persist
 | pointer line | `[nexus] <kind> <id> <path> - <summary>` injected into a PTY | pointer line |
 | `TASK_COMPLETE` / `TASK_ESCALATE` | completion channel: message to the caller when a task ends or needs escalation | completion channels |
 | `task_id` | id of one `delegate` run (`t-<uuid8>`) | task |
-| session | one dtach PTY / registry row (never a worker) | session |
+| session | one persistent PTY / registry row (never a worker) | session |
 | workspace / `.nexus/` | local directory holding `lite.db`, inbox, stm, wiki | project directory (in nexus, "workspace" means a pod; T1 undecided) |
 | `memory.stm` | live working state (`stm/1` nodes) | STM |
 | `memory.mtm` | flow carried across interruptions; transport is the bus | MTM (MTM+ retired) |

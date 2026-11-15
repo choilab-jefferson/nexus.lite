@@ -3,7 +3,7 @@ test_nexus_lite.py — End-to-end tests for nexus-lite.
 
 Covers:
 - dtach wire protocol constants and packet serialization
-- Real dtach PTY spawn, send, keys, read, wait, list_sessions, kill
+- Real PTY spawn (stdlib ptyd server), send, keys, read, wait, list_sessions, kill
 - Provider busy/idle classification (claude, agy, gemini, copilot, opencode, bash)
 - Bus send & read, inbox markdown persistence, and live PTY pointer line injection
 - Delegate execution, artifact creation, depth enforcement, and TASK_COMPLETE notifications
@@ -104,7 +104,6 @@ def test_pty_classifier():
     assert not pty.is_busy("user@host:~$ ", provider="bash")
 
 
-@pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach binary not available")
 def test_real_dtach_pty_lifecycle():
     """Test real dtach PTY spawn, send, read, keys, and kill."""
     sess_name = "test-pty-1"
@@ -127,7 +126,6 @@ def test_real_dtach_pty_lifecycle():
     assert not any(s["name"] == sess_name for s in sessions_after)
 
 
-@pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach binary not available")
 def test_bus_send_pointer_injection(isolated_env):
     """Test bus_send writes markdown inbox and injects pointer line into live dtach session."""
     receiver_name = "receiver-sess"
@@ -161,7 +159,6 @@ def test_bus_send_pointer_injection(isolated_env):
     pty.kill(receiver_name)
 
 
-@pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach binary not available")
 def test_delegate_execution_and_notification(isolated_env):
     """Test task delegation creates artifacts, updates DB, and notifies caller PTY."""
     caller_sess = "caller-agent"
@@ -269,7 +266,6 @@ def test_cli_integration(isolated_env, capsys):
     assert "Hello via CLI bus" in captured.out
 
 
-@pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach binary not available")
 def test_chat_helper(isolated_env):
     """Test chat helper sends message and waits for rendered output."""
     sess_name = "chat-sess"
@@ -280,7 +276,6 @@ def test_chat_helper(isolated_env):
     pty.kill(sess_name)
 
 
-@pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach binary not available")
 def test_delegate_background(isolated_env):
     """Test delegate in background mode (bg=True)."""
     caller_sess = "bg-caller"
@@ -364,7 +359,6 @@ def test_safe_gemini_drive_sync_no_overwrite(tmp_path):
     assert local_dir.is_symlink()
 
 
-@pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach binary not available")
 def test_cli_pty_and_delegate(isolated_env, capsys):
     """Test CLI commands for pty and delegate."""
     # CLI pty new
@@ -444,7 +438,6 @@ def test_live_agy_delegate_oneshot():
     assert "HELLO_AGY_CONFIRMED" in (art_dir / "output.md").read_text()
 
 
-@pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach binary not available")
 def test_multi_agent_swarm_and_pipeline(isolated_env):
     """
     Test real multi-agent orchestration:
@@ -548,7 +541,6 @@ def test_multi_agent_swarm_and_pipeline(isolated_env):
     pty.kill("orchestrator")
 
 
-@pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach binary not available")
 def test_visualization_dashboard(isolated_env, capsys):
     """
     Test live HTML5/Colab visualization dashboard:
@@ -885,7 +877,7 @@ def test_devcontainer_json_validity():
     assert "Nexus-Lite" in ports_attrs["8765"].get("label", "")
 
     post_cmd = cfg.get("postCreateCommand", "")
-    assert "dtach" in post_cmd
+    assert "dtach" not in post_cmd  # PTY sessions need no dtach binary
     assert "pip install" in post_cmd
 
     settings = cfg.get("customizations", {}).get("vscode", {}).get("settings", {})
@@ -960,7 +952,7 @@ def test_pty_key_to_bytes_and_agent_normalization(monkeypatch):
     assert nl.key_to_bytes("hello") == b"hello"
     assert nl.keys_to_bytes(["c-a", "hi", "enter"]) == b"\x01hi\r"
 
-    monkeypatch.setattr(pty, "find_opencode_bin", lambda: "/usr/local/bin/opencode")
+    monkeypatch.setattr(pty.agents, "find_opencode_bin", lambda: "/usr/local/bin/opencode")
     assert pty.normalize_agent_cmd("opencode", mode="pty") == "/usr/local/bin/opencode -m opencode/big-pickle"
     assert (
         pty.normalize_agent_cmd("opencode/mimo-v2.6-flash-free", mode="oneshot", prompt="fix bug")
@@ -1184,6 +1176,7 @@ def test_cooperative_multi_agent_problem_solving(isolated_env):
     assert res["final_pytest_rc"] == 0, f"Phase-5 repaired module must pass all tests: {res['final_pytest_output']}"
     assert "6 passed" in res["final_pytest_output"]
     assert "VERDICT: PASS" in res["consensus_verdict"]
+    assert len(res["repair_rounds"]) == 1 and res["repair_rounds"][0]["pytest_rc"] == 0
 
     # Verify full inter-agent DM / handoff / broadcast pointer chain (7 messages across 4 peer agents)
     dm_chain = res["dm_chain"]

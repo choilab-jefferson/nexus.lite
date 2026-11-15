@@ -10,7 +10,7 @@ import pytest
 
 from nexus_lite import pty
 
-pytestmark = pytest.mark.skipif(shutil.which("dtach") is None, reason="dtach required")
+pytestmark = pytest.mark.skipif(not hasattr(os, "forkpty"), reason="POSIX pty required")
 
 FAKE_AGENT = textwrap.dedent(
     """
@@ -100,8 +100,8 @@ def test_busy_markers_agy():
 def test_trust_prompt_not_answered_by_default(env, monkeypatch):
     monkeypatch.delenv("NEXUS_LITE_PTY_AUTO_TRUST", raising=False)
     calls = []
-    monkeypatch.setattr(pty, "keys", lambda *a, **k: calls.append(a))
-    monkeypatch.setattr(pty, "read", lambda *a, **k: "Do you trust the contents ⣷")
+    monkeypatch.setattr(pty.control, "keys", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(pty.control, "read", lambda *a, **k: "Do you trust the contents ⣷")
     with pytest.raises(TimeoutError):
         pty.wait("x", provider="agy", timeout=1, poll=0.2)
     assert calls == []

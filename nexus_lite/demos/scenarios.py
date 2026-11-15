@@ -1,6 +1,7 @@
 """
 nexus_lite.demos — Practical multi-agent medical imaging & radiomics workflows
-powered by `qradiomics` (public v0.9.5+) and the `medimage` 13-chapter Colab curriculum,
+powered by `qradiomics` (public v0.9.8+ from PyPI, pure-Python IBSI-1 + legacy
+`rtools`, `pyradiomics` optional) and the `medimage` 13-chapter Colab curriculum,
 orchestrating real `agy` (Antigravity) and `claude` (Claude Code) CLI agents.
 
 Workflows included:
@@ -376,15 +377,19 @@ def _run_llm_pipeline(
 def ensure_qradiomics_colab(
     install_medimage_deps: bool = True,
     quiet: bool = False,
+    include_pyradiomics: bool = False,
 ) -> dict[str, Any]:
     """
-    Bootstrap public `qradiomics` (v0.9.5+) and `medimage` dependencies in Google Colab or local venv.
-    Installs upstream `pyradiomics` from git (required on Python 3.10+) and `choilab-jefferson/qradiomics`.
+    Bootstrap public `qradiomics` (v0.9.8+ from PyPI) and `medimage` dependencies
+    in Google Colab or local venv. Pure-Python IBSI-1 + legacy `rtools` extraction
+    runs with zero C++ build steps; set `include_pyradiomics=True` only when optional
+    upstream `pyradiomics` cross-engine comparison is needed.
     """
-    pkgs = [
-        "pyradiomics @ git+https://github.com/AIM-Harvard/pyradiomics.git@8ed579383b44806651c463d5e691f3b2b57522ab",
-        "qradiomics @ git+https://github.com/choilab-jefferson/qradiomics.git",
-    ]
+    pkgs = ["qradiomics>=0.9.8", "numpy>=2.0"]
+    if include_pyradiomics:
+        pkgs.append(
+            "pyradiomics @ git+https://github.com/AIM-Harvard/pyradiomics.git@8ed579383b44806651c463d5e691f3b2b57522ab"
+        )
     if install_medimage_deps:
         pkgs.extend(["SimpleITK", "pydicom", "nibabel", "scikit-image", "scikit-learn", "matplotlib", "pandas"])
 

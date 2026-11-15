@@ -2222,6 +2222,14 @@ def run_cooperative_problem_solver(
         "draft_pytest_rc": p3_pytest.returncode,
         "final_pytest_rc": p5_pytest.returncode,
         "final_pytest_output": p5_test_output,
+        "repair_rounds": [
+            {
+                "round": 1,
+                "agent": "python",
+                "pytest_rc": p5_pytest.returncode,
+                "pytest_output": p5_test_output,
+            }
+        ],
         "consensus_verdict": consensus_text,
         "dm_chain": dm_chain,
         "phases": phases,

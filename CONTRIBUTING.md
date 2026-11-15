@@ -24,7 +24,7 @@ Do not file a public issue: see [SECURITY.md](SECURITY.md).
     pip install -e '.[dev,demos]' pytest-timeout
     python -m pytest -q
 
-Some tests need `dtach`, `pgrep` and `pkill`.
+Some tests need `pgrep` and `pkill`. The `dtach` binary is optional: when installed, the kill-group tests also run against it as an oracle (`NEXUS_LITE_DTACH=binary`).
 
 ## License
 

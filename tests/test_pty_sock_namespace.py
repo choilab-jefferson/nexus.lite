@@ -138,7 +138,7 @@ def test_af_unix_eopnotsupp_falls_back_to_hashed_tmp_dir(monkeypatch, short_ws):
         def socket(*_a, **_k):
             return _NoUnixSock()
 
-    monkeypatch.setattr(pty, "socket", _FakeSockMod)
+    monkeypatch.setattr(pty.control, "socket", _FakeSockMod)
     try:
         want = "/tmp/nx-" + hashlib.sha256(str(w).encode()).hexdigest()[:12]
         assert pty.default_sock_dir() == want

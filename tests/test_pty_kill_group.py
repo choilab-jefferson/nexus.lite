@@ -26,10 +26,10 @@ def ws(request, tmp_path, monkeypatch):
     monkeypatch.setenv("NEXUS_LITE_HOME", str(w))
     monkeypatch.setenv("NEXUS_LITE_SOCK_DIR", str(w / "s"))
     monkeypatch.setenv("SHELL", "/bin/sh")
-    if request.param == "python":
-        monkeypatch.setenv("NEXUS_LITE_DTACH", "python")
+    if request.param == "dtach":
+        monkeypatch.setenv("NEXUS_LITE_DTACH", "binary")  # opt-in oracle: the real dtach binary
     else:
-        monkeypatch.delenv("NEXUS_LITE_DTACH", raising=False)
+        monkeypatch.delenv("NEXUS_LITE_DTACH", raising=False)  # default: the stdlib server
     _db.reset_init()
     yield w
     shutil.rmtree(w, ignore_errors=True)

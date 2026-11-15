@@ -1,4 +1,4 @@
-"""Notebook hygiene: README badge coverage, generator determinism, v0.2.2 notebook runs."""
+"""Notebook hygiene: README badge coverage, generator determinism, kernel primitives notebook runs."""
 import json
 import pathlib
 import subprocess
@@ -32,8 +32,8 @@ def test_generator_is_deterministic_and_matches_committed():
             (NB_DIR / name).write_text(text)
 
 
-def test_v022_notebook_code_cells_run(tmp_path):
-    nb = json.loads((NB_DIR / "v022_primitives_colab.ipynb").read_text())
+def test_kernel_primitives_notebook_code_cells_run(tmp_path):
+    nb = json.loads((NB_DIR / "kernel_primitives_colab.ipynb").read_text())
     src = "\n\n".join(
         "".join(l for l in c["source"] if not l.lstrip().startswith("!"))
         for c in nb["cells"] if c["cell_type"] == "code"
@@ -43,4 +43,9 @@ def test_v022_notebook_code_cells_run(tmp_path):
     r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120, cwd=tmp_path,
                        env={**__import__("os").environ, "PYTHONPATH": str(ROOT), "NEXUS_LITE_HOME": str(tmp_path / "h")})
     assert r.returncode == 0, r.stderr[-2000:]
-    assert "run_on_colab result" in r.stdout and "BLOCKED" in r.stdout
+    assert (
+        "pty output : True" in r.stdout
+        and "ballot     : yes" in r.stdout
+        and "BLOCKED" in r.stdout
+        and "run_on_colab result" in r.stdout
+    )

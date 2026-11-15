@@ -286,17 +286,16 @@ def test_tunnel_server_and_colab_client(env):
         assert res["rc"] == 0
         assert "30" in res["stdout"]
 
-        # PTY (requires dtach binary on host)
-        if tunnel.shutil.which("dtach"):
-            sess = client.pty_spawn("bash --norc", name="tunnel-test-sess")
-            assert sess == "tunnel-test-sess"
-            client.pty_send(sess, "echo 'PTY_RUN_OK'", enter=True)
-            time.sleep(0.3)
-            screen = client.pty_read(sess)
-            assert "PTY_RUN_OK" in screen
-            sessions = client.pty_list()
-            assert any(s["name"] == sess for s in sessions)
-            client.pty_kill(sess)
+        # PTY (stdlib ptyd server; no dtach binary needed)
+        sess = client.pty_spawn("bash --norc", name="tunnel-test-sess")
+        assert sess == "tunnel-test-sess"
+        client.pty_send(sess, "echo 'PTY_RUN_OK'", enter=True)
+        time.sleep(0.3)
+        screen = client.pty_read(sess)
+        assert "PTY_RUN_OK" in screen
+        sessions = client.pty_list()
+        assert any(s["name"] == sess for s in sessions)
+        client.pty_kill(sess)
 
         # Bus
         bmsg = client.bus_send(target="test-target", message="bus hello", sender="client")

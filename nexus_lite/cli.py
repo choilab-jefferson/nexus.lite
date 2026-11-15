@@ -3,7 +3,7 @@ nexus_lite.cli — Command-line interface for nexus-lite.
 
 Subcommands:
 - init
-- pty (new/list/read/send/keys/wait/kill)
+- pty (new/list/read/send/keys/wait/kill/attach)
 - bus (send/read)
 - agent run (one command per bus message)
 - delegate
@@ -96,6 +96,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_pty_kill = pty_sub.add_parser("kill", help="Kill a session")
     p_pty_kill.add_argument("name", help="Session name")
+
+    pty_sub.add_parser("ls", help="List PTY sessions: no, name, provider, age, attached, alive")
+
+    p_pty_attach = pty_sub.add_parser(
+        "attach", help="Attach this terminal to a session (no argument: numbered picker; detach with Ctrl-\\)")
+    p_pty_attach.add_argument("name", nargs="?", help="Session number from `pty ls`, part of a session name, or a "
+                                                      "socket path (omit for the picker)")
+    p_pty_attach.add_argument("--ro", action="store_true", help="Watch only: never send input (q also detaches)")
+    g_detach = p_pty_attach.add_mutually_exclusive_group()
+    g_detach.add_argument("--detach-char", "-e", default=None,
+                          help="Detach key as ^X or a single character (default: $NEXUS_PTY_DETACH, else ^\\)")
+    g_detach.add_argument("--no-detach", "-E", action="store_true", help="Disable the detach key")
 
     # bus
     p_bus = sub.add_parser("bus", help="Message bus commands (MTM: flow carried across interruptions; transport = bus)")
@@ -307,6 +319,25 @@ def main(argv: Optional[list[str]] = None) -> int:
                 pty.kill(args.name)
                 print(f"Killed session {args.name}")
                 return 0
+
+            elif args.pty_subcommand == "ls":
+                from .pty import picker as _picker
+                info = _picker.sessions_info()
+                print(_picker.format_table(info) if info else "No active sessions.")
+                return 0
+
+            elif args.pty_subcommand == "attach":
+                from .pty import cli as _ptycli
+                from .pty import picker as _picker
+                if args.no_detach:
+                    detach = None
+                else:
+                    detach = _ptycli.parse_detach_char(args.detach_char) if args.detach_char else \
+                        _picker.detach_from_env(b"\x1c")
+                    if detach is None:
+                        print(f"Error: invalid detach key {args.detach_char!r}", file=sys.stderr)
+                        return 2
+                return _picker.attach_command(args.name, detach, ro=args.ro)
 
         elif args.subcommand == "bus":
             if not args.bus_subcommand:

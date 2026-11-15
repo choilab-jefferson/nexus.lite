@@ -1,0 +1,20 @@
+[>4;2m[?u[?2026$p[?1049h[?2004h[?1004h[?25l[?12$p[?1007$p[c[H[2J[>q[14t]10;?\]11;?\]4;0;?\]4;1;?\]4;2;?\]4;3;?\]4;4;?\]4;5;?\]4;6;?\]4;7;?\]4;8;?\]4;9;?\]4;10;?\]4;11;?\]4;12;?\]4;13;?\]4;14;?\]4;15;?\[?25l[22;0t]0;GitHub Copilot]7501;state=idle:app=copilot\[H[2J Home: current tab: Current, Sessions, Issues, Pull requests, Gists[?996n[4;31H[1;34mGetting started
+[C[mCopilot v1.0.107 uses AI.    Use the tabs above to explore your sessions and pull requests
+ Check for mistakes.[6;31H/init — Initialize Copilot instructions for this repository[7;31H/model — Switch models across providers, or use Auto[23B[1mConfirm folder trust
+[0;90m╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[m /tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work[136C[90m│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+[mCopilot can read files in this folder and, with your permission, edit them or run code and shell commands. It will remember your permissions for the rest of this session.
+
+Git commands run in this folder may use configuration from the enclosing repository and execute programs configured by that repository.
+
+Do you trust the files in this folder?
+
+[97;44mCurrent selection: 1. Yes[39m[K
+[2C[m2. Yes, and remember this folder for future sessions
+  3. No (Esc)
+
+[1m↑/↓[m to navigate · [1menter[m to select · [1mesc[m to cancel[9;2H[33mWarning:[m Failed to load 2 skills. Run /skills for more details.
+
+ [33mWarning:[m Run /login again to use Connectors. Your saved GitHub authorization is missing the write:plugin_gateway_connections permission.[7;79HCopilot Fusion]111;]110;[?25h[23;0t[?1004l[?2004l[>4;0m

@@ -1,0 +1,260 @@
+[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ echo hello 안녕 ✓ 日本語
+[?2004lhello 안녕 ✓ 日本語
+[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ ls -la --color=always
+[?2004ltotal 8
+drwxrwxr-x 2 user01 user01  80 Nov 14 15:43 [0m[01;34m.[0m
+drwxrwxr-x 5 user01 user01 220 Nov 14 15:43 [01;34m..[0m
+-rw-rw-r-- 1 user01 user01  39 Nov 14 15:43 a.txt
+-rw-rw-r-- 1 user01 user01 852 Nov 14 15:43 b.txt
+[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ printf "\033[1;31mred\033[0m \033[4munder\033[0m\n"
+[?2004l[1;31mred[0m [4munder[0m
+[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ cat b.txt
+[?2004lrow 1
+row 2
+row 3
+row 4
+row 5
+row 6
+row 7
+row 8
+row 9
+row 10
+row 11
+row 12
+row 13
+row 14
+row 15
+row 16
+row 17
+row 18
+row 19
+row 20
+row 21
+row 22
+row 23
+row 24
+row 25
+row 26
+row 27
+row 28
+row 29
+row 30
+row 31
+row 32
+row 33
+row 34
+row 35
+row 36
+row 37
+row 38
+row 39
+row 40
+row 41
+row 42
+row 43
+row 44
+row 45
+row 46
+row 47
+row 48
+row 49
+row 50
+row 51
+row 52
+row 53
+row 54
+row 55
+row 56
+row 57
+row 58
+row 59
+row 60
+row 61
+row 62
+row 63
+row 64
+row 65
+row 66
+row 67
+row 68
+row 69
+row 70
+row 71
+row 72
+row 73
+row 74
+row 75
+row 76
+row 77
+row 78
+row 79
+row 80
+row 81
+row 82
+row 83
+row 84
+row 85
+row 86
+row 87
+row 88
+row 89
+row 90
+row 91
+row 92
+row 93
+row 94
+row 95
+row 96
+row 97
+row 98
+row 99
+row 100
+row 101
+row 102
+row 103
+row 104
+row 105
+row 106
+row 107
+row 108
+row 109
+row 110
+row 111
+row 112
+row 113
+row 114
+row 115
+row 116
+row 117
+row 118
+row 119
+row 120
+[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ echo "a very long line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+[?2004la very long line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ less a.txt
+[?2004l[?1049h[22;0;0t[40;1H[?1h=line one
+line two 안녕 ✓ 日本語
+[7ma.txt (END)[27m[K[K[?1l>[?1049l[23;0;0t[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ less b.txt
+[?2004l[?1049h[22;0;0t[40;1H[?1h=row 1
+row 2
+row 3
+row 4
+row 5
+row 6
+row 7
+row 8
+row 9
+row 10
+row 11
+row 12
+row 13
+row 14
+row 15
+row 16
+row 17
+row 18
+row 19
+row 20
+row 21
+row 22
+row 23
+row 24
+row 25
+row 26
+row 27
+row 28
+row 29
+row 30
+row 31
+row 32
+row 33
+row 34
+row 35
+row 36
+row 37
+row 38
+row 39
+[7mb.txt[27m[K[Krow 40
+row 41
+row 42
+row 43
+row 44
+row 45
+row 46
+row 47
+row 48
+row 49
+row 50
+row 51
+row 52
+row 53
+row 54
+row 55
+row 56
+row 57
+row 58
+row 59
+row 60
+row 61
+row 62
+row 63
+row 64
+row 65
+row 66
+row 67
+row 68
+row 69
+row 70
+row 71
+row 72
+row 73
+row 74
+row 75
+row 76
+row 77
+row 78
+:[K[Krow 79
+row 80
+row 81
+row 82
+row 83
+row 84
+row 85
+row 86
+row 87
+row 88
+row 89
+row 90
+row 91
+row 92
+row 93
+row 94
+row 95
+row 96
+row 97
+row 98
+row 99
+row 100
+row 101
+row 102
+row 103
+row 104
+row 105
+row 106
+row 107
+row 108
+row 109
+row 110
+row 111
+row 112
+row 113
+row 114
+row 115
+row 116
+row 117
+:[K[K[?1l>[?1049l[23;0;0t[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ clear
+[?2004l[H[2J[3J[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ echo after-clear
+[?2004lafter-clear
+[?2004huser01@h:/tmp/claude-1007/-home-user01-gitRepos-nexus/662af206-9b09-43bf-b348-79203a61a12a/scratchpad/rec/work2$ exit
+[?2004lexit
+

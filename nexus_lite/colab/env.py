@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -180,7 +179,7 @@ def ensure_colab(
     **kwargs: Any,
 ) -> ColabInitResult:
     """
-    Ensure dtach is installed, initialize workspace, and optionally mount Drive and sync credentials.
+    Initialize workspace, and optionally mount Drive and sync credentials.
 
     Parameters:
     - drive_path: Custom workspace directory path on Google Drive or filesystem.
@@ -192,13 +191,6 @@ def ensure_colab(
     to '/content/drive/MyDrive/nexus-lite', set NEXUS_LITE_DIR to persistent_dir,
     and call sync_dotdir_to_drive('/root/.gemini', f'{persistent_dir}/.gemini').
     """
-    if shutil.which("dtach") is None:
-        try:
-            subprocess.run(["apt-get", "update", "-qq"], check=False)
-            subprocess.run(["apt-get", "install", "-y", "-qq", "dtach"], check=True)
-        except Exception as e:
-            sys.stderr.write(f"Warning: dtach install failed: {e}\n")
-
     if install_opencode is None:
         install_opencode = "google.colab" in sys.modules or bool(os.environ.get("COLAB_RELEASE_TAG"))
     opencode_bin = ensure_opencode(install=bool(install_opencode))
@@ -273,7 +265,7 @@ def ensure_env(
     - In 'colab': defaults mount_drive=True (delegating to ensure_colab) and
       automatically syncs ~/.gemini with /content/drive/MyDrive/.gemini (or gemini_drive_path).
     - In 'devcontainer', 'codespaces', 'docker', or 'local': defaults mount_drive=False.
-      Ensures dtach is available and initializes workspace (.nexus/).
+      Initializes workspace (.nexus/).
     """
     env_kind = detect_env()
 
@@ -290,13 +282,6 @@ def ensure_env(
         return res
 
     # Non-colab environments: devcontainer, codespaces, docker, local
-    if shutil.which("dtach") is None:
-        try:
-            subprocess.run(["apt-get", "update", "-qq"], check=False)
-            subprocess.run(["apt-get", "install", "-y", "-qq", "dtach"], check=True)
-        except Exception as e:
-            sys.stderr.write(f"Warning: dtach install failed: {e}\n")
-
     opencode_bin = ensure_opencode(install=bool(install_opencode))
 
     target_ws = persistent_dir or workspace

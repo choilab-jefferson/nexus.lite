@@ -75,7 +75,7 @@ def test_explicit_drive_path_keeps_sockets_off_drive(tmp_path, monkeypatch):
     drive_mnt = tmp_path / "drive_mnt"
     ws = drive_mnt / "nexus_workspace"
     ws.mkdir(parents=True)
-    monkeypatch.setattr(pty, "_DRIVE_FUSE_PREFIXES", (str(drive_mnt),))
+    monkeypatch.setattr(pty.control, "_DRIVE_FUSE_PREFIXES", (str(drive_mnt),))
     monkeypatch.delenv("NEXUS_LITE_SOCK_DIR", raising=False)
     monkeypatch.setattr(core.Path, "home", lambda: tmp_path / "home")
     res = colab_env.ensure_colab(drive_path=str(ws), install_opencode=False)

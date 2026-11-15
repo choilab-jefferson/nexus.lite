@@ -14,6 +14,6 @@ labels: bug
 - nexus-lite version (`pip show nexus-lite`):
 - Python version:
 - OS / Colab:
-- dtach installed (`dtach -v`):
+- PTY server (`NEXUS_LITE_DTACH` value, default stdlib `nexus_lite.pty serve`):
 
 **Logs / traceback**

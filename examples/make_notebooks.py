@@ -13,7 +13,7 @@ def build(title, gpu, env_note, models, env_vars, hetero, tiny=False):
     cells = [
         md(f"# {title}\n\nRuntime → **{gpu}**. {env_note}\nRuns Ollama on the Colab GPU and drives a parallel swarm + sequential pipeline of *local* model agents via `nexus_lite.run_swarm` / `run_pipeline`. No API keys."),
         md("## 1. GPU check + install"),
-        code("!nvidia-smi --query-gpu=name,memory.total --format=csv\n!apt-get update -qq && apt-get install -y -qq dtach zstd\n!pip install -qU nexus-lite\n!curl -fsSL https://ollama.com/install.sh | sh"),
+        code("!nvidia-smi --query-gpu=name,memory.total --format=csv\n!apt-get update -qq && apt-get install -y -qq zstd\n!pip install -qU nexus-lite\n!curl -fsSL https://ollama.com/install.sh | sh"),
         md("## 2. Start Ollama (GPU) and pull model(s)"),
         code("import subprocess, time, urllib.request, os\n"
              f"MODELS = {models!r}\nMODEL = MODELS[0]\n"
@@ -158,20 +158,22 @@ def loom_multi_agent_nb():
             "nbformat": 4, "nbformat_minor": 5}
 
 
-def v022_primitives_nb():
+def kernel_primitives_nb():
     cells = [
-        md("# nexus-lite v0.2.2+ kernel primitives on Colab\n\n"
-           "Runnable tour of the three primitive areas added in v0.2.2+: (1) memory tiers + Bus v1 semantics, "
-           "(2) the `NEXUS_SENSITIVITY=phi` gate with `stm/1` redaction, (3) zero-preinstall remote compute "
-           "(`pack_self_contained_script` / `run_on_colab`) over a local loopback tunnel. No GPU, no API keys."),
+        md("# nexus-lite kernel primitives on Colab\n\n"
+           "Runnable tour of the core `nexus-lite` v0.3.x pure-Python stdlib kernel primitives: "
+           "(1) 3-tier memory (`stm`/`mtm`/`ltm`), (2) Bus v3 monotonic `seq` + multi-consumer cursors (`consumer=`), "
+           "(3) dependency-free PTY controller (`nexus_lite.pty`), (4) code-tallied `ballot` voting + `cas` blobs + "
+           "`#nexus.ledger/2` step ledgers, (5) `NEXUS_SENSITIVITY=phi` gate with `stm/1` redaction, and "
+           "(6) zero-preinstall remote compute (`run_local_sandbox` / `run_on_colab`). No GPU, no API keys."),
         md("## 1. Install"),
         code("!pip install -qU nexus-lite"),
         md("## 2. Memory tiers: STM, MTM, LTM\n"
            "Everything lives in an isolated scratch workspace (`NEXUS_LITE_DIR`). MTM flow checkpoints are bus messages of "
            "`kind='checkpoint'`; the bus is the MTM transport."),
-        code("import os, tempfile\n"
+        code("import os, pathlib, shutil, tempfile, time\n"
              "os.environ.pop('NEXUS_SENSITIVITY', None)\n"
-             "os.environ['NEXUS_LITE_DIR'] = tempfile.mkdtemp(prefix='nexus-v022-')\n"
+             "os.environ['NEXUS_LITE_DIR'] = tempfile.mkdtemp(prefix='nexus-prims-')\n"
              "from nexus_lite import _db\n"
              "_db.reset_init()\n"
              "from nexus_lite.memory import stm, mtm, ltm\n\n"
@@ -185,21 +187,57 @@ def v022_primitives_nb():
              "# LTM: markdown wiki + FTS5 search\n"
              "ltm.wiki_write('notes/radiomics', '# Radiomics\\nIBSI first-order features need discretisation.')\n"
              "print('ltm search :', [h['slug'] for h in ltm.wiki_search('discretisation')])"),
-        md("## 3. Bus v1: monotonic `seq`, ack cursors, offline redelivery, prune"),
+        md("## 3. Bus v3: monotonic `seq`, multi-consumer cursors, offline redelivery, prune"),
         code("m1 = mtm.bus_send('bob', 'first', sender='al')\n"
              "m2 = mtm.bus_send('bob', 'second', sender='al')\n"
              "print('monotonic seq:', m1['seq'], '<', m2['seq'])\n\n"
              "# bob was offline when the messages were sent; registering redelivers them\n"
              "print('redelivered  :', mtm.bus_register('bob')['redelivered'] == [m1['id'], m2['id']])\n\n"
-             "# ack moves the cursor (never backwards)\n"
-             "print('bus_ack      :', mtm.bus_ack('bob', m1['seq']))\n"
-             "with _db.connect() as con:\n"
-             "    print('bus_cursors  :', [(r['target'], r['acked_seq']) for r in con.execute('SELECT target, acked_seq FROM bus_cursors')])\n"
-             "print('unacked      :', [m['summary'] for m in mtm.bus_read('bob', unacked=True)])\n\n"
-             "# prune deletes only acked messages (seq 1); the unacked one survives\n"
+             "# Independent per-consumer cursors: advancing 'auditor' leaves 'indexer' untouched\n"
+             "mtm.bus_ack('bob', m1['seq'], consumer='auditor')\n"
+             "print('auditor left :', [m['summary'] for m in mtm.bus_read('bob', unacked=True, consumer='auditor')])\n"
+             "print('indexer left :', [m['summary'] for m in mtm.bus_read('bob', unacked=True, consumer='indexer')])\n\n"
+             "# Once all active consumers ack m1, bus_prune deletes m1 while keeping unacked m2\n"
+             "mtm.bus_ack('bob', m1['seq'], consumer='indexer')\n"
+             "time.sleep(0.01)\n"
              "print('bus_prune    :', mtm.bus_prune(0), 'deleted')\n"
-             "print('unacked left :', [m['summary'] for m in mtm.bus_read('bob', unacked=True)])"),
-        md("## 4. PHI sensitivity gate\n"
+             "print('unacked left :', [m['summary'] for m in mtm.bus_read('bob', unacked=True, consumer='auditor')])"),
+        md("## 4. Persistent PTY sessions (`nexus_lite.pty`, no `dtach` binary required)"),
+        code("from nexus_lite import pty\n\n"
+             "sock_dir = tempfile.mkdtemp(prefix='nxs-', dir='/tmp')\n"
+             "os.environ['NEXUS_LITE_SOCK_DIR'] = sock_dir\n"
+             "sess = pty.spawn('cat', name='demo-pty')\n"
+             "try:\n"
+             "    pty.send(sess, 'stdlib-pty-ready')\n"
+             "    screen_txt = ''\n"
+             "    for _ in range(30):\n"
+             "        screen_txt = pty.read(sess, settle=0.05)\n"
+             "        if 'stdlib-pty-ready' in screen_txt:\n"
+             "            break\n"
+             "        time.sleep(0.1)\n"
+             "    active = [s['name'] for s in pty.list_sessions()]\n"
+             "    print('pty output :', 'stdlib-pty-ready' in screen_txt, '| active:', active)\n"
+             "    assert 'stdlib-pty-ready' in screen_txt\n"
+             "finally:\n"
+             "    pty.kill_session(sess)\n"
+             "    shutil.rmtree(sock_dir, ignore_errors=True)\n"
+             "    os.environ.pop('NEXUS_LITE_SOCK_DIR', None)"),
+        md("## 5. Code-tallied `ballot` voting, content-addressed `cas`, and `#nexus.ledger/2`"),
+        code("from nexus_lite import ballot, cas, ledger\n\n"
+             "art = pathlib.Path(os.environ['NEXUS_LITE_DIR']) / 'ibsi_check.txt'\n"
+             "art.write_text('270/270 pass\\n', encoding='utf-8')\n\n"
+             "ballot.open_ballot('ibsi-gate', 'Approve IBSI parity?', ['arch', 'phys', 'stat'], opener='lead', attach=[str(art)])\n"
+             "ballot.cast('ibsi-gate', 'arch', 'yes')\n"
+             "st = ballot.cast('ibsi-gate', 'phys', 'yes')\n"
+             "print('ballot     :', st['decided'], f\"({st['yes']} yes / {st['no']} no)\")\n"
+             "assert st['decided'] == 'yes'\n\n"
+             "sha = cas.put(art)\n"
+             "assert cas.get(sha) == b'270/270 pass\\n'\n"
+             "print('cas sha256 :', sha[:16])\n\n"
+             "led = pathlib.Path(os.environ['NEXUS_LITE_DIR']) / 'steps.ledger'\n"
+             "ledger.append(led, 'ibsi_verify', 'OK', 0.15, '-', str(art), 'PASS')\n"
+             "print('ledger rows:', len(ledger.rows(led)))"),
+        md("## 6. PHI sensitivity gate\n"
            "With `NEXUS_SENSITIVITY=phi` only local runners (local Ollama, shell, python) may be dispatched; cloud CLIs are refused. "
            "`stm/1` summaries are redacted in the packed brief."),
         code("from nexus_lite.phi import phi_gate_error\n"
@@ -213,12 +251,14 @@ def v022_primitives_nb():
              "print('summaries  :', [n['summary'] for n in brief['nodes']])\n"
              "assert all(n['summary'] == '' for n in brief['nodes'])\n"
              "os.environ.pop('NEXUS_SENSITIVITY')"),
-        md("## 5. Zero-preinstall remote compute\n"
-           "`pack_self_contained_script` builds one self-extracting `.py` that carries `nexus_lite`; `run_on_colab` ships it "
-           "to a runtime over `POST /exec`. Here the 'remote' is a loopback tunnel server in this same runtime, so it runs with no external setup."),
+        md("## 7. Zero-preinstall remote compute\n"
+           "`pack_self_contained_script` builds one self-extracting `.py` that carries `nexus_lite`; `run_local_sandbox` runs it "
+           "in an isolated `python -I` process and `run_on_colab` ships it to a runtime over `POST /exec`."),
         code("import nexus_lite.compute as compute\n"
              "packed = compute.pack_self_contained_script(python='RESULT = 6 * 7')\n"
-             "print('packed script:', len(packed[0]), 'bytes')\n\n"
+             "print('packed script:', len(packed[0]), 'bytes')\n"
+             "sb = compute.run_local_sandbox(python='RESULT = {\"sandbox\": 6 * 7}')\n"
+             "print('local sandbox:', sb['result'])\n\n"
              "from nexus_lite.colab import tunnel as colab_tunnel\n"
              "info = colab_tunnel.start_tunnel(port=0, tunnel=False)\n"
              "try:\n"
@@ -233,7 +273,7 @@ def v022_primitives_nb():
             "nbformat": 4, "nbformat_minor": 5}
 
 
-nbs["v022_primitives_colab.ipynb"] = v022_primitives_nb()
+nbs["kernel_primitives_colab.ipynb"] = kernel_primitives_nb()
 
 nbs["loom_multi_agent_colab.ipynb"] = loom_multi_agent_nb()
 for n, nb in nbs.items():

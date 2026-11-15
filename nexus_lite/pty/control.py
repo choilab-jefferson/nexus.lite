@@ -1,10 +1,11 @@
 """
-nexus_lite.pty — Persistent PTY controller over dtach wire protocol and pyte.
+nexus_lite.pty.control — session control API: spawn, send, keys, read, wait, kill and discovery (stdlib only).
 
 Features:
-- dtach 10-byte wire protocol (<BB8s):
-    MSG_PUSH=0, MSG_ATTACH=1, MSG_DETACH=2, MSG_WINCH=3, MSG_REDRAW=4
-- Screen rendering via pyte
+- Sessions served by ``python -m nexus_lite.pty serve`` (no dtach binary needed; the binary is used only with
+  NEXUS_LITE_DTACH=binary)
+- dtach 10-byte wire protocol (see :mod:`nexus_lite.pty.protocol`), spoken through :class:`~.client.Connection`
+- Screen rendering with :mod:`nexus_lite.pty.screen` (no third-party terminal emulator)
 - Per-socket flock concurrency control (<sock>.lock)
 - Multi-agent state classifier (claude, agy, gemini, copilot, opencode, bash)
 - Session lifecycle: spawn, send, keys, read, wait, list_sessions, kill
@@ -13,7 +14,6 @@ Features:
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import glob
 import hashlib
 import json
@@ -24,7 +24,6 @@ import shutil
 import signal
 import socket
 import stat
-import struct
 import subprocess
 import sys
 import threading
@@ -32,19 +31,21 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
-from ._db import get_workspace, mark_session
-from ._proc import reap_in_background
+from .._db import get_workspace, mark_session
+from .._proc import reap_in_background
+from .agents import normalize_agent_cmd, provider_of
+from .client import Connection
+from .protocol import (  # noqa: F401  (re-exported by the package)
+    MSG_ATTACH, MSG_DETACH, MSG_PUSH, MSG_REDRAW, MSG_WINCH, PKT, PUSH_MAX, packet, probe_connect, sock_lock,
+    winch_packet,
+)
+from .screen import Screen, render  # noqa: F401
 
-# dtach wire protocol constants
-MSG_PUSH = 0
-MSG_ATTACH = 1
-MSG_DETACH = 2
-MSG_WINCH = 3
-MSG_REDRAW = 4
-
-_PKT = struct.Struct("<BB8s")
-assert _PKT.size == 10
-_PUSH_MAX = 8
+_PKT = PKT
+_PUSH_MAX = PUSH_MAX
+_packet = packet
+_winch_packet = winch_packet
+_probe_connect = probe_connect
 
 # Common spinners used across AI agent CLIs
 SPINNERS = (
@@ -148,23 +149,6 @@ def keys_to_bytes(tokens: Iterable[str]) -> bytes:
     if isinstance(tokens, str):
         tokens = tokens.split()
     return b"".join(key_to_bytes(t) for t in tokens)
-
-
-def _packet(ptype: int, data: bytes = b"") -> bytes:
-    d = data[:_PUSH_MAX]
-    return _PKT.pack(ptype, len(d), d.ljust(_PUSH_MAX, b"\x00"))
-
-
-def _winch_packet(rows: int, cols: int) -> bytes:
-    ws = struct.pack("<HHHH", rows, cols, 0, 0)
-    return _PKT.pack(MSG_WINCH, 0, ws)
-
-
-# Public aliases: downstream consumers import these; private names kept.
-PKT = _PKT
-PUSH_MAX = _PUSH_MAX
-packet = _packet
-winch_packet = _winch_packet
 
 
 SUN_PATH_MAX = 103   # macOS sun_path is 104 bytes with the NUL (Linux 108)
@@ -292,46 +276,6 @@ def session_name(sock_p: str) -> str:
     return base
 
 
-@contextlib.contextmanager
-def sock_lock(sock: str, timeout: float = 10.0):
-    """Acquire flock on {sock}.lock."""
-    lock_file = f"{sock}.lock"
-    fh = open(lock_file, "a")
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                fh.close()
-                raise TimeoutError(f"lock timeout for {sock}")
-            time.sleep(0.05)
-    try:
-        yield
-    finally:
-        try:
-            fcntl.flock(fh, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        fh.close()
-
-
-def _probe_connect(path: str, timeout: float = 0.5) -> bool:
-    """Check if socket is currently accepting connections."""
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect(path)
-        return True
-    except OSError:
-        return False
-    finally:
-        try:
-            s.close()
-        except OSError:
-            pass
-
 
 def _pid_alive(pid: int) -> bool:
     try:
@@ -353,19 +297,25 @@ def _read_pid_sidecar(sock_path: str) -> Optional[int]:
     return None
 
 
-def _pid_argv_has(pid: int, token: str) -> bool:
-    """True if ``token`` is an exact argv element of ``pid`` (PID-reuse guard)."""
+def pid_argv(pid: int) -> Optional[list]:
+    """Full argv of ``pid``, or None. Linux: ``/proc/<pid>/cmdline`` split on NUL (exact, never truncated).
+    Elsewhere: ``ps -ww`` (unlimited width; without it ps may cut the command at the column width)."""
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return token.encode() in f.read().split(b"\0")
+            return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
     except OSError:
         pass
     try:
-        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+        out = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
                              capture_output=True, text=True, timeout=5).stdout
-        return token in shlex.split(out)
+        return shlex.split(out) or None
     except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+        return None
+
+
+def _pid_argv_has(pid: int, token: str) -> bool:
+    """True if ``token`` is an exact argv element of ``pid`` (PID-reuse guard)."""
+    return token in (pid_argv(pid) or [])
 
 
 def _write_pid_sidecar(sock_path: str, pid: int) -> None:
@@ -434,6 +384,30 @@ def _kill_group(pgid: int, grace_s: float = 1.0) -> list:
     return _group_members(pgid)
 
 
+PTYD_MODULE = "nexus_lite.ptyd"  # pre-package module name; python -m nexus_lite.ptyd is still a valid launcher
+PTY_MODULE = "nexus_lite.pty"
+
+
+def _is_master_argv(argv: list, sock_path: str) -> bool:
+    """argv of a process that may own ``sock_path``: the stdlib server (``python -m nexus_lite.pty serve ... SOCK -- CMD``,
+    or the pre-package ``python -m nexus_lite.ptyd ... SOCK -- CMD``),
+    a dtach binary (``dtach -n|-A|-c SOCK ...``, sessions started with NEXUS_LITE_DTACH=binary or before the switch),
+    or the pre-ptyd stdlib daemon (``python -m nexus_lite.pty --serve SOCK -- CMD``). Attach clients carry the
+    socket too; callers tell masters apart by their child (the PTY program)."""
+    if not argv or sock_path not in argv:
+        return False
+    if os.path.basename(argv[0]) == "dtach":
+        return True
+    try:
+        cut = argv.index("--")
+    except ValueError:
+        cut = len(argv)
+    head = argv[:cut]
+    if sock_path not in head:
+        return False
+    return PTYD_MODULE in head or (PTY_MODULE in head and ("serve" in head or "--serve" in head))
+
+
 def _scan_proc(sock_path: str) -> Optional[int]:
     """Linux /proc scan; see find_dtach_master_pid."""
     matches: list[int] = []
@@ -445,7 +419,7 @@ def _scan_proc(sock_path: str) -> Optional[int]:
             except OSError:
                 continue
             argv = [a.decode("utf-8", "replace") for a in raw.split(b"\x00") if a]
-            if argv and os.path.basename(argv[0]) == "dtach" and sock_path in argv:
+            if _is_master_argv(argv, sock_path):
                 try:
                     matches.append(int(cmdline_path.split("/")[2]))
                 except (IndexError, ValueError):
@@ -466,10 +440,10 @@ def _scan_proc(sock_path: str) -> Optional[int]:
 
 
 def _scan_ps(sock_path: str) -> Optional[int]:
-    """macOS/BSD fallback: parse ``ps -axo pid=,ppid=,command=`` (no pgrep needed)."""
+    """macOS/BSD fallback: parse ``ps -ww -axo pid=,ppid=,command=`` (no pgrep needed)."""
     try:
         out = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,command="],
+            ["ps", "-ww", "-axo", "pid=,ppid=,command="],  # -ww: never truncate the command column
             capture_output=True, text=True, timeout=5,
         ).stdout
     except Exception:
@@ -486,7 +460,7 @@ def _scan_ps(sock_path: str) -> Optional[int]:
         except ValueError:
             continue
         parents.add(ppid)
-        if argv and os.path.basename(argv[0]) == "dtach" and sock_path in argv:
+        if _is_master_argv(argv, sock_path):
             matches.append(pid)
     with_children = [p for p in matches if p in parents]
     return with_children[0] if len(with_children) == 1 else None
@@ -496,9 +470,10 @@ def find_dtach_master_pid(sock_path: str) -> Optional[int]:
     """PID of the process that OWNS ``sock_path`` (its master, not a client).
 
     Order: (1) live ``<sock>.pid`` sidecar (written by spawn() and the stdlib
-    fallback daemon); (2) Linux ``/proc`` scan; (3) ``ps`` parse when ``/proc``
-    is absent (macOS/BSD). The scans pick processes whose argv[0] basename is
-    ``dtach`` and whose argv carries ``sock_path`` as an EXACT token; only the
+    server itself); (2) Linux ``/proc`` scan; (3) ``ps`` parse when ``/proc``
+    is absent (macOS/BSD). The scans pick server processes (``nexus_lite.pty serve``,
+    or a ``dtach`` binary / the old ``nexus_lite.pty --serve`` daemon, see
+    ``_is_master_argv``) whose argv carries ``sock_path`` as an EXACT token; only the
     master owns a child (the inner PTY leader), so exactly one candidate with
     children wins; zero or several is ambiguous -> None. Never guesses. Never
     raises."""
@@ -526,7 +501,8 @@ try:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(sock)
     _PKT = struct.Struct('<BB8s')
-    s.sendall(_PKT.pack(1, 0, b'\\x00'*8))
+    s.sendall(_PKT.pack(5, 0, b"\\x00"*8))  # MSG_SIDECAR: an observer, not a person (ignored by dtach masters)
+    s.sendall(_PKT.pack(1, 0, b"\\x00"*8))
     ws = struct.pack('<HHHH', {CAPTURE_ROWS}, {CAPTURE_COLS}, 0, 0)
     s.sendall(_PKT.pack(3, 0, ws))
     f = open(sb, 'ab')
@@ -559,206 +535,16 @@ except Exception:
         pass
 
 
-DEFAULT_OPENCODE_MODEL = "opencode/big-pickle"
-OPENCODE_FREE_MODELS = (
-    "opencode/big-pickle",
-    "opencode/mimo-v2.6-flash-free",
-    "opencode/glm-5.3-flash-free",
-    "opencode/deepseek-v4.1-flash-free",
-    "opencode/beam-free",
-    "opencode/flint-40b-free",
-    "opencode/nemotron-3.5-lightning-free",
-    "opencode/nemotron-3.5-super-vl-free",
-)
-
-
-def _is_exec_file(p: Union[str, Path]) -> bool:
-    """Return True if p is an existing executable file, ignoring PermissionError on restricted paths."""
-    try:
-        return os.path.isfile(str(p)) and os.access(str(p), os.X_OK)
-    except OSError:
-        return False
-
-
-def find_opencode_bin() -> Optional[str]:
-    """Locate the opencode CLI binary, preferring ~/.opencode/bin (v2 installer) over global PATH."""
-    for candidate in (
-        Path.home() / ".opencode" / "bin" / "opencode",
-        Path("/root/.opencode/bin/opencode"),
-    ):
-        if _is_exec_file(candidate):
-            return str(candidate)
-    found = shutil.which("opencode")
-    if found:
-        return found
-    if _is_exec_file(Path("/usr/local/bin/opencode")):
-        return "/usr/local/bin/opencode"
-    return None
-
-
-def _parse_opencode_model(cmd: Union[str, list[str]]) -> Optional[str]:
-    """
-    If cmd specifies an opencode agent invocation, return the target model ID
-    (defaulting to DEFAULT_OPENCODE_MODEL = 'opencode/big-pickle').
-    Otherwise return None.
-    """
-    if isinstance(cmd, list):
-        if not cmd:
-            return None
-        first = os.path.basename(cmd[0].strip())
-        if first != "opencode":
-            return None
-        for i, tok in enumerate(cmd[1:], start=1):
-            if tok in ("-m", "--model") and i + 1 < len(cmd):
-                return cmd[i + 1]
-            if tok.startswith("--model="):
-                return tok.split("=", 1)[1]
-        return DEFAULT_OPENCODE_MODEL
-
-    if isinstance(cmd, str):
-        stripped = cmd.strip()
-        if stripped == "opencode":
-            return DEFAULT_OPENCODE_MODEL
-        if stripped.startswith("opencode/"):
-            # Shorthand like "opencode/big-pickle" or "opencode/mimo-v2.6-flash-free"
-            if stripped == "opencode/minimax-m2.5-free":
-                return "opencode/mimo-v2.6-flash-free"
-            return stripped
-        if stripped.startswith("opencode:"):
-            model_part = stripped.split(":", 1)[1].strip()
-            return model_part if "/" in model_part else f"opencode/{model_part}"
-        try:
-            parts = shlex.split(stripped)
-        except ValueError:
-            parts = stripped.split()
-        if parts and os.path.basename(parts[0]) == "opencode":
-            # Only normalize if not already a raw 'opencode run ...' command with a message
-            if len(parts) >= 2 and parts[1] == "run":
-                return None
-            for i, tok in enumerate(parts[1:], start=1):
-                if tok in ("-m", "--model") and i + 1 < len(parts):
-                    return parts[i + 1]
-                if tok.startswith("--model="):
-                    return tok.split("=", 1)[1]
-            return DEFAULT_OPENCODE_MODEL
-    return None
-
-
-CLAUDE_DECLUTTER_SETTINGS: dict[str, object] = {
-    "prefersReducedMotion": True,
-    "spinnerTipsEnabled": False,
-    "terminalProgressBarEnabled": False,
-}
-AGY_DECLUTTER_SETTINGS: dict[str, object] = {
-    "altScreenMode": False,
-    "showTips": False,
-    "showFeedbackSurvey": False,
-    "artifactReviewPolicy": "always-proceed",
-}
-COPILOT_SCREEN_READER_ARGS: tuple[str, ...] = (
-    "--screen-reader",
-    "--plain-diff",
-    "--no-mouse",
-    "--no-auto-update",
-)
-GEMINI_SCREEN_READER_ARGS: tuple[str, ...] = ("--screen-reader",)
-
-_AGENT_BINS = ("claude", "agy", "copilot", "gemini")
-
-
-def _settings_arg(settings: dict[str, object]) -> str:
-    return shlex.quote(json.dumps(settings, separators=(",", ":")))
-
-
-def _normalize_known_agent(
-    cmd: Union[str, list[str]], mode: str, prompt: Optional[str], declutter: bool
-) -> Optional[str]:
-    """Build the command for claude/agy/copilot/gemini, or None if `cmd` is not one of them."""
-    try:
-        toks = list(cmd) if isinstance(cmd, list) else shlex.split(cmd)
-    except ValueError:
-        return None
-    if not toks or toks[0] not in _AGENT_BINS:
-        return None
-    bin_ = toks[0]
-    has = set(toks)
-    out = list(toks)
-
-    def add(*flags: str) -> None:
-        for f in flags:
-            if f not in has:
-                out.append(f)
-                has.add(f)
-
-    extra: list[str] = []
-    if bin_ in ("claude", "agy"):
-        if bin_ == "agy" or "--permission-mode" not in has:
-            add("--dangerously-skip-permissions")
-        if declutter:
-            if bin_ == "claude":
-                if os.environ.get("NEXUS_CLAUDE_SCREEN_READER") != "0":
-                    add("--ax-screen-reader")
-                if "--settings" not in has:
-                    extra += ["--settings", _settings_arg(CLAUDE_DECLUTTER_SETTINGS)]
-            elif "--settings" not in has:
-                extra += ["--settings", _settings_arg(AGY_DECLUTTER_SETTINGS)]
-    elif bin_ == "copilot":
-        add("--allow-all-tools")
-        if declutter and os.environ.get("NEXUS_COPILOT_SCREEN_READER") != "0":
-            add(*COPILOT_SCREEN_READER_ARGS)
-    else:  # gemini
-        if "--yolo" not in has:
-            add("-y")
-        if (declutter and mode == "pty" and os.environ.get("NEXUS_GEMINI_SCREEN_READER") != "0"):
-            add(*GEMINI_SCREEN_READER_ARGS)
-    line = " ".join([shlex.quote(t) for t in out] + extra)
-    if mode != "pty" and prompt is not None:
-        line += " -p " + shlex.quote(prompt)
-    return line
-
-
-def normalize_agent_cmd(
-    cmd: Union[str, list[str]],
-    mode: str = "pty",
-    prompt: Optional[str] = None,
-    declutter: Optional[bool] = None,
-) -> Union[str, list[str]]:
-    """
-    Normalize agent command for pty or oneshot execution.
-    - claude/agy/copilot/gemini get their auto-approve flag; in pty mode (declutter default on,
-      opt out with NEXUS_LITE_PTY_DECLUTTER=0) also screen-reader / declutter flags so TUI
-      animations, borders and alt-screen noise do not reach the orchestrator.
-      Oneshot mode appends "-p <prompt>" and declutters only if declutter=True.
-    - Expands "opencode" (or "opencode -m <model>" / "opencode/<model>") to use
-      OpenCode's built-in zero-signup free models (default: opencode/big-pickle) via
-      "opencode run --standalone --auto -m <model> <prompt>" in oneshot mode.
-    """
-    if declutter is None:
-        declutter = mode == "pty" and os.environ.get("NEXUS_LITE_PTY_DECLUTTER", "1") != "0"
-    known = _normalize_known_agent(cmd, mode, prompt, declutter)
-    if known is not None:
-        return known
-
-    opencode_model = _parse_opencode_model(cmd)
-    if opencode_model is not None:
-        oc_bin = shlex.quote(find_opencode_bin() or "opencode")
-        q_model = shlex.quote(opencode_model)
-        if mode == "pty":
-            return f"{oc_bin} -m {q_model}"
-        if prompt is not None:
-            return f"{oc_bin} run --standalone --auto -m {q_model} {shlex.quote(prompt)}"
-        return f"{oc_bin} run --standalone --auto -m {q_model}"
-
-    return cmd
-
-
 def spawn(
     cmd: Union[str, list[str]],
     name: Optional[str] = None,
     cwd: Optional[str] = None,
     env: Optional[dict] = None,
 ) -> str:
-    """Launch a command inside a persistent dtach PTY session and return session name."""
+    """Launch a command inside a persistent PTY session and return session name.
+
+    The session is served by ``python -m nexus_lite.pty serve`` (stdlib only); NEXUS_LITE_DTACH=binary uses an
+    installed dtach binary instead. Both speak the same wire protocol."""
     cmd = normalize_agent_cmd(cmd, mode="pty")
 
     if not name:
@@ -773,7 +559,7 @@ def spawn(
                 os.unlink(sp)
             except OSError:
                 pass
-            for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid"):
+            for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
                 if os.path.exists(sibling):
                     try:
                         os.unlink(sibling)
@@ -784,37 +570,29 @@ def spawn(
     shell = os.environ.get("SHELL", "/bin/bash")
     cd_prefix = f"cd {shlex.quote(str(cwd))} && " if cwd else ""
     inner = f"{cd_prefix}{cmd_str}"
-    use_py = _use_python_dtach()
-    if use_py:
-        argv = [sys.executable, "-m", "nexus_lite.pty", "--serve", sp, "--", shell, "-lc", inner]
-    else:
-        argv = ["dtach", "-n", sp, "-z", "-r", "winch", shell, "-lc", inner]
-
+    argv = _master_argv(sp, [shell, "-lc", inner])
     try:
-        reap_in_background(subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            env=env,
-        ))
-    except OSError as e:
-        raise RuntimeError(f"Failed to launch dtach: {e}") from e
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              env=env, timeout=30, start_new_session=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"Failed to start PTY session {name!r}: {e}") from e
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"Failed to start PTY session {name!r} (rc={proc.returncode}): {err}")
 
-    # Await socket availability
+    # The launcher returns after binding the socket; wait until it accepts connections.
     start = time.monotonic()
     sock_ready = False
     while time.monotonic() - start < 4.0:
         if os.path.exists(sp) and _probe_connect(sp):
             sock_ready = True
             break
-        time.sleep(0.05)
+        time.sleep(0.02)
 
     if not sock_ready:
-        raise RuntimeError(f"dtach failed to create socket {sp} within 4 seconds")
+        raise RuntimeError(f"PTY session socket {sp} did not come up within 4 seconds")
 
-    if not use_py:  # the fallback daemon writes its own sidecar
+    if os.path.basename(argv[0]) == "dtach":  # the stdlib server writes its own sidecar
         mp = _scan_proc(sp) if os.path.isdir("/proc") else _scan_ps(sp)
         if mp:
             _write_pid_sidecar(sp, mp)
@@ -822,12 +600,10 @@ def spawn(
 
     # Set initial terminal geometry (240 cols x 45 rows)
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(1.0)
-            s.connect(sp)
-            s.sendall(_packet(MSG_ATTACH))
-            s.sendall(_winch_packet(CAPTURE_ROWS, CAPTURE_COLS))
-            s.sendall(_packet(MSG_DETACH))
+        with Connection(sp, timeout=1.0) as conn:
+            conn.attach()
+            conn.winch(CAPTURE_ROWS, CAPTURE_COLS)
+            conn.detach()
     except Exception:
         pass
 
@@ -842,6 +618,8 @@ def spawn(
         time.sleep(0.02)
 
     mark_session(name, True)  # a (re)spawned name is live on the bus registry
+    with contextlib.suppress(OSError):  # provider label and creation time for `pty ls`
+        Path(f"{sp}.meta").write_text(json.dumps({"provider": provider_of(cmd), "created": time.time()}))
     return name
 
 
@@ -857,22 +635,11 @@ def send(name: str, text: Union[str, bytes], enter: bool = True) -> None:
     fp_before = _fingerprint(sp)
 
     with sock_lock(sp):
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(5.0)
-        try:
-            s.connect(sp)
-            # Push data in 8-byte chunks
-            for i in range(0, len(data), _PUSH_MAX):
-                chunk = data[i : i + _PUSH_MAX]
-                s.sendall(_packet(MSG_PUSH, chunk))
+        with Connection(sp) as conn:
+            conn.push(data)  # 8-byte PUSH records
             if enter:
                 time.sleep(0.05)
-                s.sendall(_packet(MSG_PUSH, b"\r"))
-        finally:
-            try:
-                s.close()
-            except OSError:
-                pass
+                conn.push(b"\r")
     _write_sendmark(name, sp, fp_before)
 
 
@@ -913,26 +680,14 @@ def keys(name: str, *tokens: str) -> None:
         raise RuntimeError(f"Session '{name}' is not running ({sp})")
 
     with sock_lock(sp):
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(5.0)
-        try:
-            s.connect(sp)
+        with Connection(sp) as conn:
             for token in tokens:
-                b = key_to_bytes(token)
-                for i in range(0, len(b), _PUSH_MAX):
-                    chunk = b[i : i + _PUSH_MAX]
-                    s.sendall(_packet(MSG_PUSH, chunk))
+                conn.push(key_to_bytes(token))
                 time.sleep(0.02)
-        finally:
-            try:
-                s.close()
-            except OSError:
-                pass
 
 
 def read(name: str, cols: int = CAPTURE_COLS, rows: int = CAPTURE_ROWS, settle: float = 0.25) -> str:
-    """Read and render session screen text using pyte."""
-    import pyte
+    """Read the session screen: the scrollback tail rendered by :mod:`nexus_lite.pty.screen` (trimmed text)."""
 
     sp = sock_path(name)
     if settle > 0:
@@ -952,52 +707,23 @@ def read(name: str, cols: int = CAPTURE_COLS, rows: int = CAPTURE_ROWS, settle: 
 
     # If scrollback is not present or empty, fallback to direct attach & winch
     if not raw and os.path.exists(sp) and _probe_connect(sp):
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2.0)
         try:
-            s.connect(sp)
-            s.sendall(_packet(MSG_ATTACH))
-            # Nudge the size so a redraw happens even when it equals the current geometry.
-            s.sendall(_winch_packet(rows + 1, cols))
-            time.sleep(0.1)
-            s.sendall(_winch_packet(rows, cols))
-            s.setblocking(False)
-            t0 = time.monotonic()
-            extra = bytearray()
-            while time.monotonic() - t0 < 0.3:
-                try:
-                    ch = s.recv(4096)
-                    if not ch:
-                        break
-                    extra.extend(ch)
-                except (BlockingIOError, InterruptedError):
-                    time.sleep(0.02)
-                except OSError:
-                    break
-            try:
-                s.sendall(_packet(MSG_DETACH))
-            except OSError:
-                pass
-            raw = bytes(extra)
+            with Connection(sp, timeout=2.0) as conn:
+                conn.attach()
+                # Nudge the size so a redraw happens even when it equals the current geometry.
+                conn.winch(rows + 1, cols)
+                time.sleep(0.1)
+                conn.winch(rows, cols)
+                raw = conn.collect(0.3)
+                with contextlib.suppress(OSError):
+                    conn.detach()
         except Exception:
             pass
-        finally:
-            try:
-                s.close()
-            except OSError:
-                pass
 
     if not raw:
         return ""
 
-    screen = pyte.Screen(cols, rows)
-    stream = pyte.Stream(screen)
-    stream.feed(raw.decode("utf-8", "replace"))
-
-    lines = [ln.rstrip() for ln in screen.display]
-    while lines and not lines[-1].strip():
-        lines.pop()
-    return "\n".join(lines)
+    return render(raw, cols, rows)
 
 
 _SPIN = list(SPINNERS)
@@ -1181,7 +907,7 @@ def list_sessions() -> list[dict]:
                     os.unlink(sp)
                 except OSError:
                     pass
-                for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid"):
+                for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
                     if os.path.exists(sibling):
                         try:
                             os.unlink(sibling)
@@ -1218,7 +944,7 @@ def kill_session(name: str) -> list:
             pass
     leftovers = _kill_group(pgid) if pgid else []
 
-    for path in (sp, f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid"):
+    for path in (sp, f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
         if os.path.exists(path):
             try:
                 os.unlink(path)
@@ -1264,138 +990,56 @@ def inject_or_send(
 
 
 # ---------------------------------------------------------------------------
-# Stdlib dtach fallback: used when the dtach binary is absent (or
-# NEXUS_LITE_DTACH=python). Speaks the same <BB8s protocol as the client code.
+# Session server selection and interactive attach
 # ---------------------------------------------------------------------------
 
-def _use_python_dtach() -> bool:
-    return (os.environ.get("NEXUS_LITE_DTACH", "").lower() == "python"
-            or shutil.which("dtach") is None)
+def _use_dtach_binary() -> bool:
+    """True only on explicit opt-in (NEXUS_LITE_DTACH=binary); the default is the stdlib server."""
+    return os.environ.get("NEXUS_LITE_DTACH", "").lower() in ("binary", "dtach")
 
 
-def _serve(sock: str, argv: list[str]) -> None:
-    """Detach (double-fork), then run ``argv`` in a PTY and serve ``sock``.
+def _master_argv(sp: str, cmd: list) -> list:
+    """Launcher argv for a detached session on ``sp`` running ``cmd`` (redraw method: winch).
+    Both forms carry ``sp`` as an exact argv token of the long-lived master."""
+    if _use_dtach_binary():
+        dtach = shutil.which("dtach")
+        if dtach is None:
+            raise RuntimeError("NEXUS_LITE_DTACH=binary but no dtach binary on PATH")
+        return [dtach, "-n", sp, "-z", "-r", "winch", *cmd]
+    return [sys.executable, "-m", PTY_MODULE, "serve", "-r", "winch", sp, "--", *cmd]
 
-    Writes ``<sock>.pid``; exits when the child exits, on SIGTERM, or when
-    ``sock`` is unlinked."""
-    import select
-    import signal
-    import termios
 
-    if os.fork():
-        return
-    os.setsid()
-    if os.fork():
-        os._exit(0)
+def attach(name: str, detach_char: Optional[bytes] = b"\x1c", *, ro: bool = False, label: Optional[str] = None,
+           redraw: Optional[int] = None) -> int:
+    """Attach the calling terminal to session ``name`` interactively (raw mode, every key goes to the program,
+    no suspend key). ``detach_char`` (default Ctrl-\\, None disables) detaches; the session keeps running. ``ro``:
+    watch only, never sends PUSH (``q`` also detaches). ``label``: print ``[attached: LABEL ...]`` /
+    ``[detached: LABEL]``. ``redraw``: redraw method sent on attach (protocol REDRAW_* value; default: the session's)."""
+    from . import client as _client
+    from .protocol import REDRAW_UNSPEC
+    sp = sock_path(name)
+    if not os.path.exists(sp):
+        raise RuntimeError(f"Session '{name}' is not running ({sp})")
+    return _client.attach(sp, detach_char=detach_char, redraw=REDRAW_UNSPEC if redraw is None else redraw, ro=ro,
+                          label=label)
 
-    pidf = f"{sock}.pid"
-    Path(pidf).write_text(f"{os.getpid()}\n")
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+def read_meta(sp: str) -> dict:
+    """``<sock>.meta`` written by :func:`spawn` (``provider``, ``created``); ``{}`` for sessions not started by it."""
     try:
-        srv.bind(sock)
-        srv.listen(8)
-        st0 = os.stat(sock)
-        ident = (st0.st_dev, st0.st_ino)
-
-        def _same_sock() -> bool:
-            try:
-                st = os.stat(sock)
-            except OSError:
-                return False
-            return (st.st_dev, st.st_ino) == ident
-        child, mfd = os.forkpty()
-        if child == 0:
-            try:
-                os.execvp(argv[0], argv)
-            finally:
-                os._exit(127)
-        fcntl.ioctl(mfd, termios.TIOCSWINSZ, struct.pack("<HHHH", 24, 80, 0, 0))
-
-        def _term(*_a):
-            raise SystemExit(0)
-        signal.signal(signal.SIGTERM, _term)
-
-        clients: dict[socket.socket, list] = {}  # sock -> [attached, inbuf]
-        done = False
-        while not done and _same_sock():
-            rl, _, _ = select.select([srv, mfd, *clients], [], [], 0.5)
-            for r in rl:
-                if r is srv:
-                    c, _ = srv.accept()
-                    c.setblocking(False)
-                    clients[c] = [False, b""]
-                elif r is mfd:
-                    try:
-                        data = os.read(mfd, 65536)
-                    except OSError:
-                        data = b""
-                    if not data:
-                        done = True
-                        break
-                    for c, st in list(clients.items()):
-                        if st[0]:
-                            try:
-                                c.send(data)
-                            except OSError:
-                                pass
-                else:
-                    try:
-                        chunk = r.recv(4096)
-                    except BlockingIOError:
-                        continue
-                    except OSError:
-                        chunk = b""
-                    if not chunk:
-                        clients.pop(r).clear()
-                        r.close()
-                        continue
-                    st = clients[r]
-                    st[1] += chunk
-                    while len(st[1]) >= _PKT.size:
-                        ptype, ln, payload = _PKT.unpack(st[1][:_PKT.size])
-                        st[1] = st[1][_PKT.size:]
-                        if ptype == MSG_PUSH:
-                            os.write(mfd, payload[:ln])
-                        elif ptype == MSG_ATTACH:
-                            st[0] = True
-                        elif ptype == MSG_DETACH:
-                            st[0] = False
-                        elif ptype == MSG_WINCH:
-                            fcntl.ioctl(mfd, termios.TIOCSWINSZ, payload)
-                            try:
-                                os.killpg(child, signal.SIGWINCH)
-                            except OSError:
-                                pass
-                        elif ptype == MSG_REDRAW:
-                            try:
-                                os.write(mfd, b"\x0c")
-                            except OSError:
-                                pass
-            if not done and os.waitpid(child, os.WNOHANG)[0]:
-                done = True
-    except SystemExit:
-        pass
-    finally:
-        try:
-            os.killpg(child, signal.SIGHUP)
-        except (OSError, NameError, UnboundLocalError):
-            pass
-        try:
-            if _same_sock():
-                os.unlink(sock)
-        except (OSError, NameError, UnboundLocalError):
-            pass
-        try:
-            if Path(pidf).read_text().strip() == str(os.getpid()):
-                os.unlink(pidf)
-        except OSError:
-            pass
-        os._exit(0)
+        meta = json.loads(Path(f"{sp}.meta").read_text())
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
-if __name__ == "__main__":
-    _args = sys.argv[1:]
-    if len(_args) >= 4 and _args[0] == "--serve" and _args[2] == "--":
-        _serve(_args[1], _args[3:])
-    else:
-        sys.exit("usage: python -m nexus_lite.pty --serve <sock> -- <cmd...>")
+def last_human_input(sock: str) -> Optional[float]:
+    """Epoch time of the last keystroke an interactive client (one that sent ATTACH: ``attach``, ``dtach -a``, a
+    terminal) typed into the session, from ``<sock>.input`` written by the stdlib server; None when nobody has typed
+    or the session is not served by it (a ``dtach`` binary keeps no stamp). Programmatic ``send`` / ``keys``
+    connections never attach, so they do not count. ``sock`` is a socket path or a session name."""
+    sp = sock if ("/" in sock or sock.endswith(".sock")) else sock_path(sock)
+    try:
+        return float(Path(f"{sp}.input").read_text().strip())
+    except (OSError, ValueError):
+        return None

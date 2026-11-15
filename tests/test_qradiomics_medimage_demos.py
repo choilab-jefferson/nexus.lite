@@ -363,3 +363,35 @@ def test_opencode_normalization_and_free_demo(isolated_demo_env, monkeypatch):
     assert "PASS" in res["pipeline"]["final_output"]
     wiki_doc = nl.wiki_read("opencode/zero_signup_multi_agent_demo")
     assert "Zero-Signup OpenCode Multi-Agent Demo" in wiki_doc
+
+
+def test_ensure_qradiomics_colab_omits_pyradiomics_by_default(monkeypatch):
+    """Verify ensure_qradiomics_colab() installs PyPI qradiomics>=0.9.8 with pyradiomics strictly optional."""
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(scenarios.subprocess, "run", fake_run)
+
+    res_default = scenarios.ensure_qradiomics_colab(install_medimage_deps=False, quiet=True)
+    assert res_default["rc"] == 0
+    assert calls, "subprocess.run should be invoked"
+    cmd_default = calls[-1]
+    assert "qradiomics>=0.9.8" in cmd_default
+    assert "numpy>=2.0" in cmd_default
+    assert not any("pyradiomics" in arg for arg in cmd_default)
+
+    res_opt = scenarios.ensure_qradiomics_colab(
+        install_medimage_deps=False, quiet=True, include_pyradiomics=True
+    )
+    assert res_opt["rc"] == 0
+    cmd_opt = calls[-1]
+    assert "qradiomics>=0.9.8" in cmd_opt
+    assert any("pyradiomics @ git+" in arg for arg in cmd_opt)
