@@ -75,10 +75,16 @@ def file_ident(path: str) -> Optional[tuple]:
     return (st.st_dev, st.st_ino)
 
 
+LOCK_SUFFIX = ".lite.lock"
+
+
 @contextlib.contextmanager
 def sock_lock(sock: str, timeout: float = 10.0):
-    """Acquire flock on ``{sock}.lock`` (serialises creation, input injection and attach-or-create)."""
-    lock_file = f"{sock}.lock"
+    """Acquire flock on ``{sock}.lite.lock`` (serialises creation, input injection and attach-or-create).
+
+    Not ``{sock}.lock``: launchers written for dtach (which takes no lock) hold that file themselves while they spawn
+    the master, so the server waiting on it would block until the launcher gave up."""
+    lock_file = f"{sock}{LOCK_SUFFIX}"
     fh = open(lock_file, "a")
     deadline = time.monotonic() + timeout
     while True:
@@ -98,6 +104,28 @@ def sock_lock(sock: str, timeout: float = 10.0):
         except OSError:
             pass
         fh.close()
+
+
+def unix_listener_state(path: str) -> Optional[bool]:
+    """Whether the kernel has a listening AF_UNIX socket bound at ``path`` (Linux ``/proc/net/unix``).
+
+    True/False when the table can be read, None elsewhere. Unlike a connect probe it does not depend on the master
+    accepting in time, so a busy master under heavy load still counts as live."""
+    try:
+        with open("/proc/net/unix", "rb") as f:
+            lines = f.read().splitlines()[1:]
+    except OSError:
+        return None
+    want = os.fsencode(path)
+    for line in lines:
+        parts = line.split(None, 7)
+        if len(parts) == 8 and parts[7] == want:
+            try:
+                if int(parts[3], 16) & 0x10000:  # __SO_ACCEPTCON: listen() was called
+                    return True
+            except ValueError:
+                continue
+    return False
 
 
 def probe_connect(path: str, timeout: float = 0.5) -> bool:

@@ -319,3 +319,21 @@ def test_exclude_ext(tmp_path):
     assert set(cas.add(d, exclude_ext=ex)) == {"a.md", "b.csv"}
     assert set(cas.status(d, exclude_ext=ex)["unstaged"]) == set()
     assert set(cas.status(d, exclude_ext=ex)["changes"]) == {"a.md", "b.csv"}
+
+
+
+def test_index_lives_next_to_the_blobs_and_reads_the_legacy_path(tmp_path):
+    """The staging index is <ws>/cas/index.json (beside sha256/ and refs/), not <ws>/.nexus/cas/index.json; an index
+    left at the old path by earlier releases is still read."""
+    from nexus_lite import cas
+    ws, art = tmp_path / "ws", tmp_path / "art"
+    art.mkdir()
+    (art / "a.txt").write_text("hello")
+    cas.add(art, ws=ws)
+    assert (ws / "cas" / "index.json").is_file()
+    assert not (ws / ".nexus").exists()
+    (ws / "cas" / "index.json").unlink()
+    legacy = ws / ".nexus" / "cas" / "index.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text('{"x": {"y": "z"}}')
+    assert cas._load_index(ws) == {"x": {"y": "z"}}

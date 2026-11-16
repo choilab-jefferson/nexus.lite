@@ -364,14 +364,21 @@ def logical_manifest(directory: PathLike, artifact_id: Optional[Callable[[str], 
 
 # ---- offline verbs: add / commit / status / diff (slice 2) ----
 def _index_path(ws: Optional[PathLike]) -> Path:
+    return _ws(ws) / "cas" / "index.json"
+
+
+def _legacy_index_path(ws: Optional[PathLike]) -> Path:
+    """Where releases up to v0.4.0 wrote the index by mistake (``<ws>/.nexus/cas/index.json``); read as a fallback."""
     return _ws(ws) / ".nexus" / "cas" / "index.json"
 
 
 def _load_index(ws: Optional[PathLike]) -> Dict[str, Dict[str, str]]:
-    try:
-        return json.loads(_index_path(ws).read_text("utf-8"))
-    except (OSError, ValueError):
-        return {}
+    for path in (_index_path(ws), _legacy_index_path(ws)):
+        try:
+            return json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def _save_index(ws: Optional[PathLike], idx: Dict[str, Dict[str, str]]) -> None:

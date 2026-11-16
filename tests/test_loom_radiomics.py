@@ -90,8 +90,15 @@ def test_cli_main_runs_all_radiomics_tasks(tmp_path, capsys):
 
 
 def test_remote_compute_and_loom_example_and_colab_notebook(tmp_path):
+    import importlib.util
     from pathlib import Path
-    from examples.remote_compute_and_loom import run_loom_radiomics_on_compute
+
+    # load by path: a foreign top-level `examples` package in site-packages would shadow `import examples.x`
+    path = Path(__file__).resolve().parent.parent / "examples" / "remote_compute_and_loom.py"
+    spec = importlib.util.spec_from_file_location("remote_compute_and_loom_example", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    run_loom_radiomics_on_compute = mod.run_loom_radiomics_on_compute
 
     bundle_out = tmp_path / "loom_colab_bundle.py"
     res_boot = run_loom_radiomics_on_compute(target="colab", bootstrap_out=str(bundle_out))

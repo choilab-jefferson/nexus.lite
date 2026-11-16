@@ -31,6 +31,7 @@ def size():
 def out(s):
     os.write(1, (s + "\r\n").encode())
 signal.signal(signal.SIGWINCH, lambda *a: out("WINCH %d %d" % size()))
+signal.signal(signal.SIGQUIT, signal.SIG_IGN)  # Ctrl-\ reaching the program must not depend on the runner's inherited disposition
 buf = b""
 while True:
     try:

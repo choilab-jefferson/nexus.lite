@@ -559,7 +559,7 @@ def spawn(
                 os.unlink(sp)
             except OSError:
                 pass
-            for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
+            for sibling in (f"{sp}.lock", f"{sp}.lite.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
                 if os.path.exists(sibling):
                     try:
                         os.unlink(sibling)
@@ -598,12 +598,12 @@ def spawn(
             _write_pid_sidecar(sp, mp)
     _record_pgid(sp)
 
-    # Set initial terminal geometry (240 cols x 45 rows)
+    # Set initial terminal geometry (240 cols x 45 rows). WINCH alone: an ATTACH here would make the server signal
+    # one more SIGWINCH right before the capture worker's attach does, a back-to-back burst that a program still
+    # starting up (or one whose handler is not reentrant) can die from.
     try:
         with Connection(sp, timeout=1.0) as conn:
-            conn.attach()
             conn.winch(CAPTURE_ROWS, CAPTURE_COLS)
-            conn.detach()
     except Exception:
         pass
 
@@ -907,7 +907,7 @@ def list_sessions() -> list[dict]:
                     os.unlink(sp)
                 except OSError:
                     pass
-                for sibling in (f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
+                for sibling in (f"{sp}.lock", f"{sp}.lite.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
                     if os.path.exists(sibling):
                         try:
                             os.unlink(sibling)
@@ -944,7 +944,7 @@ def kill_session(name: str) -> list:
             pass
     leftovers = _kill_group(pgid) if pgid else []
 
-    for path in (sp, f"{sp}.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
+    for path in (sp, f"{sp}.lock", f"{sp}.lite.lock", f"{sp}.scrollback", f"{sp}.sendmark", f"{sp}.pid", f"{sp}.pgid", f"{sp}.meta", f"{sp}.input"):
         if os.path.exists(path):
             try:
                 os.unlink(path)

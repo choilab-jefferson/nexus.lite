@@ -1144,7 +1144,7 @@ def test_multi_tier_swarm_orchestration(isolated_env):
 
     dash_html = viz.render_dashboard_html()
     assert "PEER AGENT" in dash_html
-    assert "dm:m-" in dash_html
+    assert "dm:m" in dash_html  # edge label = kind:id (file-bus ids start with "m<ms>-")
     assert "agy-architect" in dash_html
     assert "code-driver" in dash_html
     assert "opencode-reviewer" in dash_html

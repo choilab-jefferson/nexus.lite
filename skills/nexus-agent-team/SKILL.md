@@ -1,13 +1,14 @@
 ---
 name: nexus-agent-team
-description: "[Public / Open-Core] Run several AI agents (and a human lead) as one team over the nexus-lite message bus: planner / builder / runner roles, a message protocol with ids and pointers to files, cursor-based reading and acking, independent watchers, a file-mailbox relay for agents that cannot open the database, and the rule that approvals come from the human, not from another agent."
+description: "[Public / Open-Core] Run several AI agents (and a human lead) as one team over the nexus-lite message bus: planner / builder / runner roles, a message protocol with ids and pointers to files, cursor-based reading and acking, independent watchers, agents that share only a directory (VM, sandbox, Drive) through the file bus, and the rule that approvals come from the human, not from another agent."
 ---
 
 # Agent team on the nexus-lite bus
 
 A team of agents (for example one that plans, one that builds, one that runs things) can coordinate through the
-nexus-lite bus (`nexus_lite.memory.mtm`): one SQLite WAL database in the workspace (`.nexus/lite.db`, or
-`NEXUS_LITE_DIR`), no server. This skill is the working protocol; `examples/agent_team_bus.py` runs it end to end
+nexus-lite bus (`nexus_lite.memory.mtm`): one JSON file per message in the workspace bus directory
+(`.nexus/bus/`, or `NEXUS_BUS_DIR` / `--bus-dir`), cursor and session files beside them, no server. `lite.db` is only
+lite's local index of those files. Spec: `docs/specs/file-bus.md`. This skill is the working protocol; `examples/agent_team_bus.py` runs it end to end
 with scripted agents.
 
 ## 1. Roles
@@ -42,8 +43,8 @@ mtm.bus_send("builder", "[P-001] plan ready: plans/PLAN-001.md\nScope and tests 
 
 ## 3. Reading and acking
 
-Each target has cursors in `bus_cursors`; `bus_read(target, unacked=True)` returns the messages above the cursor,
-oldest first, at most `limit` rows (default 20). Drain a backlog page by page and ack what you handled:
+Each (target, consumer) has a cursor file `cur/<target>/<consumer>.json`; `bus_read(target, unacked=True)` returns
+the messages above the cursor, oldest first, at most `limit` rows (default 20). Drain a backlog page by page and ack what you handled:
 
 ```python
 def drain(me):
@@ -71,16 +72,22 @@ for m in mtm.bus_watch("builder", consumer="watch", timeout=60):   # generator; 
 `bus_watch(..., callback=fn)` runs the loop itself. Run long-lived watchers as a service rather than inside an
 agent's turn, and give each consumer its own name (`pty`, `turn`, `watch`, ...).
 
-## 5. Agents without database access
+## 5. Agents that share only a directory
 
-An agent that cannot open `lite.db` (for example one running in a VM that shares only a folder) gets a file
-mailbox and a small relay process on the host:
+No relay is needed. An agent in a VM, a sandbox or a Colab runtime that can see the bus directory reads and writes
+it directly; the bus format is plain files (temp file + rename), so Python and Go need only their standard
+libraries:
 
-- `outbox/*.json` written by the agent → posted with `bus_send(..., sender=<agent>)`; the relay records what it posted
-  and never deletes the agent's files;
-- messages for the agent → written atomically (temp file + `os.replace`) into `inbox/`, then acked on its cursor.
-
-Delivery then lags by the relay's polling interval; say so when you wait on that agent.
+- **Send**: write `msg/<target>/<id>.json` (schema in the spec, section 5) with a temp name starting `.tmp.` in the
+  same directory, then rename. The id is `m<13-digit ms>-<8 hex writer>-<6 digit counter>`; ids sort in send order.
+- **Read**: list `msg/<target>/` and `msg/ALL/`, parse each complete file, handle ids above your cursor; write your
+  cursor `cur/<target>/<consumer>.json` by temp file + rename. Delivery is at-least-once: dedupe by `id`.
+- Point lite at the same directory with `NEXUS_BUS_DIR` or `nexus-lite bus --bus-dir DIR ...`. `bus wait` is woken
+  at once by a sender on the same machine and rescans every `--poll-s` (default 1 s) otherwise, so across a shared
+  folder or Drive, delivery lags by that interval (and the file system's own listing delay); say so when you wait on
+  such an agent.
+- The old `outbox/` / `inbox/` file-mailbox relay is retired. A dead relay's leftover files are not read by the bus.
+- Redis-backed nexus workers reach this bus through the nexus.code bridge, not through lite.
 
 ## 6. Decisions and approvals
 

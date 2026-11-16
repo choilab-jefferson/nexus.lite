@@ -240,7 +240,7 @@ def test_keep_limits_the_previous_runs_only_when_set(tmp_path):
 
 
 def test_start_reports_verified_state_not_assumed_running(tmp_path, monkeypatch):
-    monkeypatch.setattr(jobs, "_spawn_launcher", lambda d, env, cwd: None)  # the launcher never starts the job
+    monkeypatch.setattr(jobs, "_spawn_launcher", lambda d, env: None)  # the launcher never starts the job
     monkeypatch.setattr(jobs, "START_WAIT_S", 0.3)
     r = _start(tmp_path, "nopid", "print(1)")
     assert r["state"] == jobs.UNKNOWN and r.get("detail")

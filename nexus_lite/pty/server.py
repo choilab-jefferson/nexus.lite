@@ -48,10 +48,11 @@ from typing import Optional, Sequence
 
 from .protocol import (
     MSG_ATTACH, MSG_DETACH, MSG_PUSH, MSG_REDRAW, MSG_SIDECAR, MSG_WINCH, PKT, PKT_SIZE, PUSH_MAX, REDRAW_CTRL_L,
-    REDRAW_NONE, REDRAW_WINCH, file_ident, probe_connect, set_nonblocking, sock_lock,
+    REDRAW_NONE, REDRAW_WINCH, file_ident, probe_connect, set_nonblocking, sock_lock, unix_listener_state,
 )
 
 _READ_CHUNK = 65536
+STAMP_INTERVAL_S = 0.5  # resolution of <sock>.input: at most one write per interval per server
 _CLIENT_HIGH_WATER = 256 << 10  # stop reading the program while every attached client has this much queued
 _CLIENT_HARD_CAP = 8 << 20      # a client that falls this far behind is disconnected (it can re-attach and redraw)
 _INPUT_HIGH_WATER = 1 << 20     # stop reading clients while this much input waits for the program
@@ -186,9 +187,9 @@ class _Server:
     def _handle(self, c: _Client, ptype: int, length: int, payload: bytes) -> None:
         if ptype == MSG_PUSH:
             if length <= PUSH_MAX:
+                self._input(payload[:length])  # forward the keystroke first; the stamp never delays it
                 if c.attached and not c.sidecar:  # an interactive client; control.send/keys never ATTACH
                     self._stamp_input()
-                self._input(payload[:length])
         elif ptype == MSG_ATTACH:
             c.attached = True
             self._update_mode()
@@ -215,7 +216,14 @@ class _Server:
         # any other type: ignored
 
     def _stamp_input(self) -> None:
-        """Record "a human typed just now": the epoch time in ``<sock>.input`` (atomic write, mode 0600)."""
+        """Record "a human typed just now": the epoch time in ``<sock>.input`` (atomic write, mode 0600).
+
+        Written at most once per ``STAMP_INTERVAL_S``, so the stamp lags real typing by under that much; readers
+        (``last_human_input``) only ask whether someone typed within the last few seconds."""
+        now = time.monotonic()
+        if now - getattr(self, "_stamped_at", -STAMP_INTERVAL_S) < STAMP_INTERVAL_S:
+            return
+        self._stamped_at = now
         tmp = f"{self.path}.input.tmp"
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -522,6 +530,16 @@ def _server_main(listener: socket.socket, path: str, ident: tuple, argv: Sequenc
         os._exit(code)
 
 
+def _master_alive(path: str) -> bool:
+    """A socket whose connect probe failed is still live while its master exists: the kernel lists a listener bound
+    at ``path``, or a master process (lite pid sidecar, or a dtach / lite master found by argv) owns it. A busy master
+    on a loaded host misses the short probe; replacing its socket would orphan the session."""
+    if unix_listener_state(path):
+        return True
+    from .control import find_dtach_master_pid  # lazy: control imports this module's siblings
+    return find_dtach_master_pid(path) is not None
+
+
 def _bind(path: str, exist_ok: bool) -> Optional[socket.socket]:
     """Bind and listen on ``path`` under the per-socket lock. A stale socket file (nothing accepts on it) is
     unlinked first; a live one means a session already owns it: ``exist_ok`` returns None, else SessionExists.
@@ -536,7 +554,7 @@ def _bind(path: str, exist_ok: bool) -> Optional[socket.socket]:
             except OSError as e:
                 if e.errno != errno.EADDRINUSE:
                     raise
-                if probe_connect(path):
+                if probe_connect(path) or _master_alive(path):
                     listener.close()
                     if exist_ok:
                         return None

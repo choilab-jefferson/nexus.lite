@@ -14,10 +14,10 @@ pytestmark = pytest.mark.skipif(not hasattr(os, "forkpty"), reason="POSIX pty re
 
 FAKE_AGENT = textwrap.dedent(
     """
-    import sys, time, signal
+    import os, sys, time, signal
     state = ["accept-edits > "]
-    def redraw(*a):
-        sys.stdout.write("\\r\x1b[2K" + state[0]); sys.stdout.flush()
+    def redraw(*a):  # os.write: a buffered write from a signal handler raises on reentry
+        os.write(1, ("\\r\x1b[2K" + state[0]).encode())
     signal.signal(signal.SIGWINCH, redraw)
     delay, busy = float(sys.argv[1]), float(sys.argv[2])
     sys.stdout.write("accept-edits > \\n"); sys.stdout.flush()
@@ -113,3 +113,20 @@ def test_read_renders_at_capture_geometry(env):
     pty.send("t", "printf '%0200d\\n' 7")
     time.sleep(0.5)
     assert "0" * 190 in pty.read("t")
+
+
+
+def test_spawn_sets_geometry_without_attach(env, monkeypatch):
+    """spawn() must not ATTACH to set the geometry: with redraw=winch every attach makes the server signal
+    SIGWINCH, and that one landed back-to-back with the capture worker's, killing programs whose handler is
+    not reentrant (a Python agent doing buffered writes in it died with 'reentrant call')."""
+    attaches = []
+
+    class Spy(pty.control.Connection):
+        def attach(self, *a, **k):
+            attaches.append(a)
+            return super().attach(*a, **k)
+
+    monkeypatch.setattr(pty.control, "Connection", Spy)
+    pty.spawn("bash --norc", name="t")
+    assert attaches == []

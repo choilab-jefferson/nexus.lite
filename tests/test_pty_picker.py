@@ -16,7 +16,7 @@ import time
 import pytest
 
 from nexus_lite import pty
-from nexus_lite.pty import client, picker
+from nexus_lite.pty import client, picker, server
 
 from .test_ptyd import PROG, Client, _alive_not_zombie, _master_pid, _wait, env, launch  # noqa: F401
 
@@ -460,7 +460,7 @@ def test_attached_client_push_stamps_last_human_input(env, tmp_path):
     t = pty.last_human_input(sp)
     assert t is not None and abs(time.time() - t) < 5
     assert (os.stat(sp + ".input").st_mode & 0o777) == 0o600
-    time.sleep(0.05)
+    time.sleep(server.STAMP_INTERVAL_S + 0.05)  # the stamp's documented resolution
     c.push(b"x")
     assert _wait(lambda: pty.last_human_input("hi") > t)  # by session name too
     assert not os.path.exists(sp + ".input.tmp")

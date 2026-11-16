@@ -28,8 +28,9 @@ Ultra-simple Colab-ready multi-agent primitives for Nexus.
    - Multi-agent busy/idle classifier (`claude`, `agy`, `gemini`, `copilot`, `opencode`, `bash`).
    - Keystroke injection (`keys`) and automated wait loops (`wait`).
 
-2. **File & SQLite Message Bus (`nexus_lite.core.bus_*`)**:
-   - Zero-broker pub/sub over SQLite WAL and `.nexus/inbox/<msg_id>.md`.
+2. **File Message Bus with a local SQLite index (`nexus_lite.core.bus_*`)**:
+   - Zero-broker pub/sub over files (`.nexus/bus/`: one JSON file per message, cursor and session files; spec `docs/specs/file-bus.md`). Files are the source of truth, so a VM, a sandbox, Colab/Drive or loom shares the bus by sharing the directory; `lite.db` is only lite's rebuildable index (`nexus-lite bus reindex`).
+   - A local sender wakes `bus wait` / `bus_watch` at once (Unix datagram notify); a poll rescan is the fallback. Legacy bodies stay in `.nexus/inbox/<msg_id>.md` for one release.
    - Real-time PTY pointer line injection: delivers `[nexus] <kind> <id> <path> - <summary>` directly into active PTY sessions.
 
 3. **Native `stm/1` Short-Term Memory Store (`nexus_lite.memory.stm`)**:
@@ -284,7 +285,31 @@ nexus-lite bus send worker1 "Please review file" --sender orchestrator --kind dm
 nexus-lite bus read --limit 10
 nexus-lite bus read --target worker1 --unacked   # each line: [kind] seq=N <id> <sender> -> <target>: <summary> (body: <file>)
 nexus-lite bus read --target worker1 --unacked --full   # ... and each whole body
-nexus-lite bus ack worker1 N                      # mark everything up to seq N handled
+nexus-lite bus ack worker1 N                      # mark everything up to seq N handled (or `ack worker1 <message id>`)
+nexus-lite bus wait --target worker1 --timeout 3600   # block until an unacked message exists, print it, exit 0
+                                                      # (124 on timeout, 2 on a usage or bus layout error; acks nothing).
+                                                      # Woken at once by a local sender; --poll-s is only the rescan fallback
+nexus-lite bus where                              # print the resolved bus dir: --bus-dir > $NEXUS_BUS_DIR >
+                                                  # <workspace>/bus (workspace = $NEXUS_LITE_DIR, else ./.nexus of the cwd);
+                                                  # `bus send` / `bus wait` print it on stderr (`bus: /abs/path`)
+nexus-lite bus --bus-dir /shared/bus read --target worker1 --unacked   # any directory is a bus (or $NEXUS_BUS_DIR)
+nexus-lite bus read --target worker1 --unacked --since-id m1763245081123-3fa9c2d1-000042   # file-native cursor
+nexus-lite bus read --target worker1 --audit      # messages below the skew window that are not provably acked
+nexus-lite bus reindex                            # rebuild lite.db's message/cursor/session rows from the bus dir
+nexus-lite bus prune --max-age-s 86400 --sessions # delete old acked messages (+ unregistered sessions)
+nexus-lite job start fit --notify planner -- python fit.py   # one `job` message to `planner` at the terminal state:
+                                                              # `bus wait` is then enough, no `job wait` polling
+nexus-lite job start fit --mem-max 64G -- python fit.py       # opt-in memory cap (64G / 512M / 80%; none by default):
+                                                              # systemd scope when available, else a watchdog; an exceeded
+                                                              # cap is `memkill` in the run dir, "memory limit exceeded" in
+                                                              # the log, verdict OOM in the `job` message and `job check`
+nexus-lite job list --all                                     # every root in the roots index (every `job start` records its
+                                                              # root once in ~/.local/share/nexus/artifacts/.xrun-roots,
+                                                              # or $NEXUS_LITE_ROOTS_INDEX); `job status|wait|check|tail|log|stop
+                                                              # NAME` also find a run started from another indexed root
+nexus-lite job roots [--prune]                                # indexed roots with run counts; --prune drops gone roots
+nexus-lite job log fit                                        # print the log path
+nexus-lite job wait fit --xrun-exit-codes                     # xrun's exit codes: 0 only for OK, 1 for FAIL/GONE/SKIP, 3 timeout
 
 # Command agent: run a command once per message to NAME (see "Command agents on the bus")
 nexus-lite agent run analyst --on-failure notify-sender --timeout 300 -- python agent.py
@@ -378,6 +403,24 @@ Exit codes map to `ok`, `task_failure` (retryable), `harness_or_policy_error`, `
 
 The loom subprocess gets an env allowlist, not your full environment: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `LOOM_*`, and provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `OLLAMA_HOST`). Add more with `LoomAdapter(env_passthrough=[...])`.
 `probe().version` reads the `version` capability (None for older binaries). `version_ok` is False below `MIN_LOOM_VERSION` (0.1.0), and `probe()` then emits a warning; unknown or unparseable versions are accepted.
+
+### Loop mode (`loom serve` over the file bus)
+
+One-shot `run_prompt` starts a process per turn. Loop mode keeps one `loom serve` alive with a persistent context and drives it through bus messages (spec `docs/specs/file-bus.md` section 13):
+
+```python
+from nexus_lite.loom import LoomAdapter, LoomLoopError
+
+with LoomAdapter().serve("/shared/bus", "worker1", provider="mock", max_turns=20, idle_timeout=600) as loop:
+    t = loop.task("Fix the failing test", constraints={"max_turns": 5}, timeout=300)   # LoomTurn
+    print(t.status, t.exit_code, t.body, t.trace_path)   # "ok" | "budget" | "timeout" | "exited" | ...
+    loop.inject("Use pytest -x from now on")              # applied before the next turn
+    ctx = loop.extract("context")                         # LoomExtract: .path .schema .sha256 .obj
+    loop.resume()                                         # resume the last interrupted turn
+    loop.stop("done")                                     # exit code 0
+```
+
+`task` and `resume` block on the bus wake-up path (replies are matched by `meta.corr`, rescan fallback `rescan=1.0` s) and return `status="timeout"` after `timeout`, or the exit-code name (`budget`, `interrupted`, ...) if serve exits first; loom's own result word stays in `t.data["status"]`. `loop.states`, `loop.jobs` (shared `job` events) and `loop.unclaimed` fill during waits or `loop.poll(timeout)`. Loop mode needs a loom whose `capabilities --json` reports `loop_mode` (loom v0.4.0 or newer, the pinned default `LOOM_VERSION`); otherwise `start()` raises `LoomLoopError`. `LoomStateLoop` and the one-shot calls are unchanged. Runnable example: `python examples/loom_loop_mode.py`. Contract test against a real binary: `LOOM_BIN=... pytest tests/test_loom_loop_interop.py` (skipped without one).
 
 ## Terminology
 

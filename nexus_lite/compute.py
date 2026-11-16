@@ -18,7 +18,9 @@ Core philosophy ("Ship `lite` and compute"):
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
+import importlib
 import io
 import json
 import os
@@ -92,8 +94,13 @@ def pack_self_contained_script(
     include_extras: bool = True,
     start_tunnel: bool = False,
     tunnel_port: int = 8765,
+    env_fields: Optional[dict[str, list[str]]] = None,
 ) -> tuple[str, str, str]:
     """Build a standalone, zero-dependency Python script that embeds `nexus_lite` and a workload.
+
+    `env_fields` maps a result key to environment variable names; the runner copies the first
+    non-empty one into the result payload (None when all are unset). Backends use it to report
+    scheduler details without the kernel knowing about any scheduler.
 
     Returns `(script_source, bundle_sha, job_id)`.
     """
@@ -113,6 +120,7 @@ def pack_self_contained_script(
         "collect_files": list(collect_files or []),
         "start_tunnel": bool(start_tunnel),
         "tunnel_port": int(tunnel_port),
+        "env_fields": {str(k): [str(n) for n in v] for k, v in (env_fields or {}).items()},
     }
     spec_json = json.dumps(spec, ensure_ascii=False)
     spec_zlib_b64 = base64.b64encode(zlib.compress(spec_json.encode("utf-8"), level=9)).decode("ascii")
@@ -294,6 +302,8 @@ def main() -> int:
         "tunnel": tunnel_info,
         "elapsed_s": round(time.time() - t0, 3),
     }}
+    for _key, _names in (SPEC.get("env_fields") or {{}}).items():
+        payload[_key] = next((os.environ[_n] for _n in _names if os.environ.get(_n)), None)
     try:
         (job_dir / "result.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
@@ -568,6 +578,86 @@ def run_local_sandbox(
         return parse_runner_output(proc.stdout, proc.stderr, proc.returncode)
 
 
+BACKEND_GROUP = "nexus_lite.compute_backends"
+PRIVATE_PACKAGE = "nexus_lite_private"
+_PUBLIC_TARGETS = ("colab", "local")
+
+
+def _coerce_backend(obj: Any) -> Any:
+    """A backend is an object with `run(**kwargs) -> dict`, or a plain callable standing for it."""
+    return obj if callable(getattr(obj, "run", None)) or callable(obj) else None
+
+
+@functools.lru_cache(maxsize=1)
+def _load_backends() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Discover extra compute backends: `(targets, status)`.
+
+    Sources: entry points in group `nexus_lite.compute_backends` (entry point name = target name,
+    object = backend), then the optional `nexus_lite_private` package when it is importable
+    (its `COMPUTE_BACKENDS` mapping). A broken plugin is skipped and reported, never raised.
+    Public targets cannot be shadowed.
+    """
+    targets: dict[str, Any] = {}
+    errors: list[str] = []
+    entry_names: list[str] = []
+    try:
+        from importlib.metadata import entry_points
+
+        for ep in entry_points(group=BACKEND_GROUP):
+            try:
+                backend = _coerce_backend(ep.load())
+            except Exception as exc:  # noqa: BLE001 - a plugin must not break the public CLI
+                errors.append(f"entry point {ep.name!r}: {exc}")
+                continue
+            if backend is not None and ep.name not in _PUBLIC_TARGETS:
+                targets[ep.name.lower()] = backend
+                entry_names.append(ep.name.lower())
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"entry points: {exc}")
+
+    overlay: dict[str, Any] = {"installed": False, "package": PRIVATE_PACKAGE}
+    try:
+        priv = importlib.import_module(PRIVATE_PACKAGE)
+    except ModuleNotFoundError as exc:
+        if exc.name != PRIVATE_PACKAGE:  # present but broken (its own missing import)
+            errors.append(f"{PRIVATE_PACKAGE}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"{PRIVATE_PACKAGE}: {exc}")
+    else:
+        overlay["installed"] = True
+        try:
+            overlay["version"] = getattr(priv, "__version__", None)
+            for name, obj in dict(getattr(priv, "COMPUTE_BACKENDS", {}) or {}).items():
+                backend = _coerce_backend(obj)
+                if backend is not None and name.lower() not in _PUBLIC_TARGETS:
+                    targets.setdefault(name.lower(), backend)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{PRIVATE_PACKAGE}: {exc}")
+    status = {
+        "overlay": overlay,
+        "entry_point_targets": sorted(entry_names),
+        "errors": errors,
+    }
+    return targets, status
+
+
+def backend_targets() -> dict[str, Any]:
+    """Extra (non-public) compute targets contributed by plugins: `{target: backend}`."""
+    return dict(_load_backends()[0])
+
+
+def available_targets() -> list[str]:
+    """All targets `compute_run` accepts: public ones plus plugin ones."""
+    return [*_PUBLIC_TARGETS, *sorted(backend_targets())]
+
+
+def overlay_status() -> dict[str, Any]:
+    """Report the private overlay and plugin state (shown by `nexus-lite info`)."""
+    targets, status = _load_backends()
+    return {**status["overlay"], "extra_targets": sorted(targets),
+            "entry_point_targets": status["entry_point_targets"], "errors": list(status["errors"])}
+
+
 def compute_run(
     target: str = "colab",
     *,
@@ -578,7 +668,7 @@ def compute_run(
     collect_files: Optional[list[str]] = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Unified dispatcher for `colab` (external runtime) or `local` (sandbox)."""
+    """Unified dispatcher for `colab` (external runtime), `local` (sandbox) or a plugin target."""
     tgt = (target or "colab").strip().lower()
     if tgt == "colab":
         return run_on_colab(
@@ -598,4 +688,8 @@ def compute_run(
             collect_files=collect_files,
             **kwargs,
         )
-    raise ValueError(f"Unknown compute target {target!r}; expected 'colab' or 'local'")
+    backend = backend_targets().get(tgt)
+    if backend is not None:
+        run = getattr(backend, "run", backend)
+        return run(python=python, cmd=cmd, lite_argv=lite_argv, files=files, collect_files=collect_files, **kwargs)
+    raise ValueError(f"Unknown compute target {target!r}; expected one of {', '.join(repr(t) for t in available_targets())}")

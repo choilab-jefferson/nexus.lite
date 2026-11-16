@@ -28,6 +28,8 @@ from typing import Optional
 
 from . import cas, compute, core, pty
 from .memory import ltm as mem_ltm
+from . import filebus as _filebus
+from ._db import get_bus_dir
 from .memory import mtm as mem_mtm
 from .memory import stm as mem_stm
 
@@ -110,37 +112,64 @@ def build_parser() -> argparse.ArgumentParser:
     g_detach.add_argument("--no-detach", "-E", action="store_true", help="Disable the detach key")
 
     # bus
-    p_bus = sub.add_parser("bus", help="Message bus commands (MTM: flow carried across interruptions; transport = bus)")
+    bus_common = argparse.ArgumentParser(add_help=False)
+    bus_common.add_argument("--bus-dir", default=argparse.SUPPRESS, metavar="DIR",
+                            help="File bus directory (default: $NEXUS_BUS_DIR, else <workspace>/bus)")
+    p_bus = sub.add_parser("bus", parents=[bus_common],
+                           help="Message bus commands (MTM: flow carried across interruptions; transport = bus)")
     bus_sub = p_bus.add_subparsers(dest="bus_subcommand", help="Bus operations")
 
-    p_bus_send = bus_sub.add_parser("send", help="Send a message (lite verb 'bus send' = nexus say/dm/relay) to an agent name or a live PTY session")
+    p_bus_send = bus_sub.add_parser("send", parents=[bus_common], help="Send a message (lite verb 'bus send' = nexus say/dm/relay) to an agent name or a live PTY session")
     p_bus_send.add_argument("target", help="Target agent name or PTY session name, or ALL (broadcast to live sessions)")
     p_bus_send.add_argument("message", help="Message body")
     p_bus_send.add_argument("--sender", default=None,
                             help="Sender identifier (default: $NEXUS_AGENT, the agent itself; else 'user')")
     p_bus_send.add_argument("--kind", default="dm", help="Message kind (dm, broadcast, task); stored as-is in the pointer line")
 
-    p_bus_read = bus_sub.add_parser("read", help="Read messages from the bus")
+    p_bus_read = bus_sub.add_parser("read", parents=[bus_common], help="Read messages from the bus")
     p_bus_read.add_argument("--target", default=None,
                             help="Filter by target name (default: $NEXUS_AGENT, the agent's own inbox; else all)")
     p_bus_read.add_argument("--limit", type=int, default=20, help="Max messages to return")
     p_bus_read.add_argument("--since-seq", type=int, default=None, help="Only messages with seq > N")
+    p_bus_read.add_argument("--since-id", default=None, help="Only messages with file id > ID (file-native, exclusive)")
+    p_bus_read.add_argument("--audit", action="store_true",
+                            help="List --target messages below the skew window that are not provably acked")
     p_bus_read.add_argument("--full", action="store_true", help="Also print each message's whole body")
     p_bus_read.add_argument("--unacked", action="store_true",
                             help="Only unacked for --target (each line shows seq=N; ack with `bus ack TARGET N`)")
 
-    p_bus_ack = bus_sub.add_parser("ack", help="Ack messages up to seq for a target")
-    p_bus_ack.add_argument("target")
-    p_bus_ack.add_argument("seq", type=int)
+    p_bus_wait = bus_sub.add_parser("wait", parents=[bus_common], help="Block until --target has an unacked message, print it and exit (push-style watching)",
+        description="Exit codes: 0 a message is waiting (printed as by `bus read`), 124 timeout, 2 usage or bus "
+                    "layout error. Nothing is acked.")
+    p_bus_wait.add_argument("--target", default=None, help="Inbox to wait on (default: $NEXUS_AGENT)")
+    p_bus_wait.add_argument("--timeout", type=float, default=None, help="Seconds before giving up (default: none)")
+    p_bus_wait.add_argument("--poll-s", type=float, default=1.0,
+                            help="Fallback rescan interval in seconds (a local sender wakes the wait at once)")
+    p_bus_wait.add_argument("--since-seq", type=int, default=None, help="Only messages with seq > N")
+    p_bus_wait.add_argument("--since-id", default=None, help="Only messages with file id > ID (file-native, exclusive)")
+    p_bus_wait.add_argument("--full", action="store_true", help="Also print each message's whole body")
 
-    p_bus_reg = bus_sub.add_parser("register", help="Mark a session live (redelivers unacked)")
+    p_bus_ack = bus_sub.add_parser("ack", parents=[bus_common],
+                                   help="Ack messages up to seq (or exactly one message id) for a target")
+    p_bus_ack.add_argument("target")
+    p_bus_ack.add_argument("seq", help="index seq N (acks everything with seq <= N) or a message id")
+    p_bus_ack.add_argument("--consumer", default=None, help="Independent cursor name (default: the default cursor)")
+
+    p_bus_reg = bus_sub.add_parser("register", parents=[bus_common], help="Mark a session live (redelivers unacked)")
     p_bus_reg.add_argument("name")
-    p_bus_unreg = bus_sub.add_parser("unregister", help="Mark a session not live")
+    p_bus_unreg = bus_sub.add_parser("unregister", parents=[bus_common], help="Mark a session not live")
     p_bus_unreg.add_argument("name")
 
-    p_bus_prune = bus_sub.add_parser("prune", help="Delete old acked messages")
+    p_bus_prune = bus_sub.add_parser("prune", parents=[bus_common], help="Delete old acked messages")
     p_bus_prune.add_argument("--max-age-s", type=float, required=True)
     p_bus_prune.add_argument("--keep-last", type=int, default=0)
+    p_bus_prune.add_argument("--sessions", action="store_true",
+                             help="Also drop unregistered sessions older than --max-age-s and their cursors")
+
+    bus_sub.add_parser("where", parents=[bus_common],
+                       help="Print the resolved bus directory (flag > $NEXUS_BUS_DIR > <workspace>/bus) and exit")
+    bus_sub.add_parser("reindex", parents=[bus_common],
+                       help="Rebuild the local SQLite index (lite.db) from the bus directory")
 
     # delegate
     p_del = sub.add_parser(
@@ -225,8 +254,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_comp.add_argument(
         "target",
-        choices=["colab", "local"],
-        help="Compute target: 'colab' (Colab runtime) or 'local' (isolated sandbox)",
+        choices=compute.available_targets(),
+        help="Compute target: 'colab' (Colab runtime), 'local' (isolated sandbox), or a plugin target "
+             "(see `nexus-lite info`)",
     )
     p_comp.add_argument("--python", "-c", default=None, help="Inline Python code to run (has `nexus_lite`/`nl`, `WORKSPACE`, `JOB_DIR`, `RESULT`)")
     p_comp.add_argument("--script", "-s", default=None, help="Path to local Python script file to ship and execute")
@@ -241,11 +271,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_comp.add_argument("--bootstrap-out", default=None, help="Write a standalone self-extracting Colab .py bundle to this path")
     p_comp.add_argument("--start-tunnel", action="store_true", help="Start nexus_lite.colab.tunnel inside the remote Colab runtime")
     p_comp.add_argument("--timeout", type=float, default=300.0, help="Execution timeout in seconds (default: 300)")
+    for _backend in compute.backend_targets().values():  # plugin backends add their own options
+        _add_args = getattr(_backend, "add_cli_arguments", None)
+        if callable(_add_args):
+            try:
+                _add_args(p_comp)
+            except argparse.ArgumentError:  # two backends declared the same option: first one wins
+                pass
+
+    sub.add_parser("info", help="Show version, private overlay status and available compute targets")
 
     sub.add_parser("pc", help="Manage dedicated Colab Agent PC workstations (bind, ls, status, unbind, checkout, run, poll, pty, publish)")
     sub.add_parser("colab", help="Colab tunnel & Agent PC commands (start, stop, status, exec, pc)")
 
     return parser
+
+
+def _print_full(m: dict) -> None:
+    """`--full`: the whole body, then the typed payload (`data`) as ONE JSON line when the message has one."""
+    print(m.get("content") or "")
+    if m.get("data") is not None:
+        print("data: " + json.dumps(m["data"], ensure_ascii=False, separators=(",", ":")))
+    print()
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -344,6 +391,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 parser.parse_args(["bus", "--help"])
                 return 0
 
+            if getattr(args, "bus_dir", None):
+                os.environ["NEXUS_BUS_DIR"] = args.bus_dir
+            if args.bus_subcommand == "where":
+                print(get_bus_dir())
+                return 0
+            if args.bus_subcommand in ("send", "wait"):
+                # a sender and a waiter that resolve different `.nexus` dirs never meet: say which one this is
+                print(f"bus: {get_bus_dir()}", file=sys.stderr)
             if args.bus_subcommand == "send":
                 sender = args.sender or os.environ.get("NEXUS_AGENT") or "user"  # an agent sends as itself
                 res = mem_mtm.bus_send(args.target, args.message, sender=sender, kind=args.kind)
@@ -353,7 +408,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             elif args.bus_subcommand == "read":
                 msgs = mem_mtm.bus_read(
                     target=args.target or os.environ.get("NEXUS_AGENT") or None, limit=args.limit,
-                    since_seq=args.since_seq, unacked=args.unacked
+                    since_seq=args.since_seq, unacked=args.unacked, since_id=args.since_id, audit=args.audit
                 )
                 if not msgs:
                     print("No messages.")
@@ -364,12 +419,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                         print(f"[{m['kind']}] seq={m['seq']} {m['id']} {m['sender']} -> {m['target']}: {m['summary']}"
                               f" (body: {m['path']})")
                         if args.full:
-                            print(m.get("content") or "")
-                            print()
+                            _print_full(m)
+                return 0
+
+            elif args.bus_subcommand == "wait":
+                target = args.target or os.environ.get("NEXUS_AGENT")
+                if not target:
+                    print("bus wait needs --target or $NEXUS_AGENT", file=sys.stderr)
+                    return 2
+                msgs = mem_mtm.bus_wait(target, timeout=args.timeout, poll_s=args.poll_s, since_seq=args.since_seq,
+                                        since_id=args.since_id)
+                if not msgs:
+                    print(f"timeout: no unacked message for {target}")
+                    return 124
+                for m in msgs:
+                    print(f"[{m['kind']}] seq={m['seq']} {m['id']} {m['sender']} -> {m['target']}: {m['summary']}"
+                          f" (body: {m['path']})")
+                    if args.full:
+                        _print_full(m)
                 return 0
 
             elif args.bus_subcommand == "ack":
-                print(f"acked {args.target} <= {mem_mtm.bus_ack(args.target, args.seq)}")
+                seq = int(args.seq) if args.seq.lstrip("-").isdigit() else args.seq
+                print(f"acked {args.target} <= {mem_mtm.bus_ack(args.target, seq, consumer=args.consumer)}")
                 return 0
 
             elif args.bus_subcommand == "register":
@@ -382,7 +454,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 0
 
             elif args.bus_subcommand == "prune":
-                print(f"pruned {mem_mtm.bus_prune(args.max_age_s, args.keep_last)}")
+                print(f"pruned {mem_mtm.bus_prune(args.max_age_s, args.keep_last, sessions=args.sessions)}")
+                return 0
+
+            elif args.bus_subcommand == "reindex":
+                r = mem_mtm.bus_reindex()
+                print(f"reindexed {r['messages']} messages, {r['cursors']} cursors, {r['sessions']} sessions")
                 return 0
 
         elif args.subcommand == "delegate":
@@ -492,6 +569,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(path)
             return 0
 
+        elif args.subcommand == "info":
+            print(json.dumps({"version": importlib.import_module(__package__).__version__,
+                              "private_overlay": compute.overlay_status(),
+                              "compute_targets": compute.available_targets()}, indent=2))
+            return 0
+
         elif args.subcommand == "compute":
             import shlex as _shlex
 
@@ -509,7 +592,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     rname = Path(item).name
                 extra_files[rname] = Path(lpath).expanduser().read_text(encoding="utf-8")
 
-            if args.target == "colab":
+            if args.target in compute.backend_targets():
+                backend = compute.backend_targets()[args.target]
+                common = dict(python=py_code, cmd=args.cmd, lite_argv=lite_argv, files=extra_files or None,
+                              collect_files=args.collect, timeout=args.timeout)
+                cli_run = getattr(backend, "cli_run", None)  # optional: map CLI args to run() itself
+                res = cli_run(args, **common) if callable(cli_run) else getattr(backend, "run", backend)(**common)
+            elif args.target == "colab":
                 res = compute.run_on_colab(
                     python=py_code,
                     cmd=args.cmd,
@@ -536,6 +625,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps(res, indent=2, ensure_ascii=False))
             return 0 if res.get("ok", False) else EXIT_FAILED
 
+    except (_filebus.BusError, TypeError, ValueError) as e:
+        if args.subcommand == "bus":  # usage or bus layout error (file bus spec 8): exit 2
+            sys.stderr.write(f"Error: {e}\n")
+            return 2
+        sys.stderr.write(f"Error: {e}\n")
+        return EXIT_FAILED
     except Exception as e:
         sys.stderr.write(f"Error: {e}\n")
         return EXIT_CONFIG if isinstance(e, (PermissionError, FileNotFoundError)) else EXIT_FAILED

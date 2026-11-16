@@ -24,11 +24,29 @@ nexus-lite job tail fit 40                                       # capped, only 
 ```
 
 - States: `OK` / `FAIL` (from the recorded exit code), `RUNNING` (pid whose start time and boot id match),
-  `GONE` (died without an exit code, or its pid was reused), `SKIP` (valid sentinel, not launched),
+  `GONE` (died without an exit code, or its pid was reused), `SKIP` (valid sentinel, not launched; the run dir file is `skipped`, the older `skip` is still read),
   `AMBIGUOUS` / `UNKNOWN` (not measurable now: never terminal, never success).
-- `wait` exit codes: 0 OK/SKIP, 1 FAIL, 3 not terminal yet, 4 GONE, 2 usage or refusal.
+- `wait` exit codes: 0 OK/SKIP, 1 FAIL, 3 not terminal yet, 4 GONE, 2 usage or refusal. `wait` blocks on a kernel
+  exit event (Linux `pidfd`, macOS `kqueue`), after checking the pid's start time and boot id; only where there is
+  none does it poll (every 1 s).
+- `job start NAME --notify TARGET -- CMD`: at the terminal state the supervisor sends ONE bus message of kind `job`
+  to TARGET (summary `<name> <verdict> rc=<rc>`, `data` = name, verdict `OK|FAIL|GONE|KILLED|OOM`, rc, run_dir, ts,
+  supervisor), sent before the exit code is recorded, so a `job wait` that returned implies the message is on the bus. A waiter then needs only `nexus-lite bus wait --target TARGET`, not a `job wait` poll beside it.
 - Root: `--root`, `$NEXUS_LITE_JOBS_ROOT`, else `<workspace>/jobs`. Re-running a name keeps the previous run under
-  `<name>/prev/`; a name whose job may still run is refused unless `--force`.
+  `<name>/prev/`; a name whose job may still run is refused unless `--force`. The job sees `RUN_DIR` = its run dir
+  (an inherited `RUN_DIR` wins; `--own-run-dir` overrides it), which is where `job ledger` writes by default.
+- `nexus-lite job log NAME` prints the log path (read it with `check`/`tail`, never follow it).
+- Roots index: every `start` records its root once (paths only, no names or logs) in
+  `~/.local/share/nexus/artifacts/.xrun-roots` (`$NEXUS_LITE_ROOTS_INDEX` / `$XRUN_ROOTS_INDEX`). `job list --all`
+  walks every indexed root; `status|wait|check|tail|log|stop NAME` look in the default root first, then in the
+  indexed ones (a name in several roots is refused: pass `--root`). `job roots [--prune]` lists/prunes the index.
+- Memory cap (opt-in): `job start NAME --mem-max 64G -- CMD` (also `512M`, `80%`; `$NEXUS_LITE_MEM_MAX`; none by
+  default). A systemd user scope with `MemoryMax=` when it really applies, else a watchdog that kills the job's process
+  group when its summed memory passes the cap (`$NEXUS_LITE_MEM_ENFORCER=watchdog|scope` forces one; poll
+  `$NEXUS_LITE_MEM_POLL`, default 2 s). The job dies alone: run dir gets `memkill`, the log "memory limit exceeded",
+  `status` shows `(memory limit exceeded (OOM: ...))`, `check` has `oom` and `mem_max_kb`, and the `job` message
+  verdict of a failed job is `OOM`. No mechanism: a stderr warning and the job runs unlimited.
+- `wait --xrun-exit-codes`: only OK exits 0; FAIL, GONE and SKIP exit 1; not terminal at the timeout stays 3.
 
 ## 2. Resume without redoing work: sentinels
 

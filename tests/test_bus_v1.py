@@ -1,6 +1,8 @@
 """Bus v1 semantics: integer seq, cursor/ack, live registry, retention."""
 
+import json
 import multiprocessing as mp
+import os
 import sqlite3
 import time
 
@@ -19,6 +21,16 @@ def ws(tmp_path, monkeypatch):
     monkeypatch.setenv("NEXUS_LITE_SOCK_DIR", str(tmp_path / "socks"))
     _db.reset_init()
     return w
+
+
+def _age_session(name, secs):
+    """Make `name`'s heartbeat `secs` old (the session file is the source of truth for liveness)."""
+    p = mtm._bus()._spath(name)
+    old = time.time() - secs
+    rec = json.loads(p.read_text())
+    rec["updated"] = old
+    p.write_text(json.dumps(rec))
+    os.utime(p, (old, old))
 
 
 @pytest.fixture
@@ -65,8 +77,7 @@ def test_all_skips_unregistered_keeps_live_sockets(sent):
     mtm.bus_register("gone")
     mtm.bus_unregister("gone")
     mtm.bus_register("stale")
-    with _db.connect() as c:
-        c.execute("UPDATE sessions SET last_seen = ? WHERE name = 'stale'", (time.time() - mtm.LIVE_TTL_S - 5,))
+    _age_session("stale", mtm.LIVE_TTL_S + 5)
     mtm.bus_send("ALL", "hi", kind="broadcast")
     # unregistered excluded; live socket w/o row ("never") and stale heartbeat ("stale") stay live
     assert [n for n, _ in log] == ["live", "never", "stale"]
@@ -99,24 +110,22 @@ def test_prune_removes_old_acked_only(ws, sent):
     old_unacked = mtm.bus_send("carl", "old-unacked")
     new = mtm.bus_send("bob", "new")
     mtm.bus_ack("bob", old["seq"])
-    with _db.connect() as c:
-        c.execute("UPDATE messages SET timestamp = timestamp - 1000 WHERE id IN (?, ?)", (old["id"], old_unacked["id"]))
-    assert mtm.bus_prune(500) == 1
+    later = time.time() + 1000  # prune ages a message by its id's ms: pretend the first two are old
+    assert mtm.bus_prune(500, now=time.time() + 100) == 0  # nothing is older than 500 s yet
+    assert mtm.bus_prune(500, now=later) == 1
     ids = {m["id"] for m in mtm.bus_read()}
     assert ids == {old_unacked["id"], new["id"]}
     assert not (ws / "inbox" / f"{old['id']}.md").exists()
     assert (ws / "inbox" / f"{new['id']}.md").exists()
     # keep_last protects even old acked messages
     mtm.bus_ack("carl", old_unacked["seq"])
-    assert mtm.bus_prune(500, keep_last=5) == 0
+    assert mtm.bus_prune(500, keep_last=5, now=later) == 0
 
 
 def test_seq_not_reused_after_prune(sent):
     a = mtm.bus_send("bob", "a")
     mtm.bus_ack("bob", a["seq"])
-    with _db.connect() as c:
-        c.execute("UPDATE messages SET timestamp = 0")
-    assert mtm.bus_prune(1) == 1
+    assert mtm.bus_prune(1, now=time.time() + 100) == 1
     assert mtm.bus_send("bob", "b")["seq"] == a["seq"] + 1
 
 
@@ -197,7 +206,6 @@ def test_all_dead_socket_not_live_even_if_fresh_registration(sent):
     assert log == []
     alive.append("old")  # live socket with a stale heartbeat stays live
     mtm.bus_register("old")
-    with _db.connect() as c:
-        c.execute("UPDATE sessions SET last_seen = ? WHERE name = 'old'", (time.time() - mtm.LIVE_TTL_S - 5,))
+    _age_session("old", mtm.LIVE_TTL_S + 5)
     mtm.bus_send("ALL", "hi2", kind="broadcast")
     assert [n for n, _ in log] == ["old"]

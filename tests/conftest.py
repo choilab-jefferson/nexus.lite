@@ -20,11 +20,21 @@ _GUARD_ENV = (
     "NEXUS_ALLOW_NESTED_MININEXUS",
     "NEXUS_SENSITIVITY",
     "NEXUS_ARTIFACTS_DIR",
+    "NEXUS_BUS_DIR",
+    "NEXUS_BUS_RUN_DIR",
+    "NEXUS_LITE_MEM_MAX",
+    "NEXUS_LITE_MEM_ENFORCER",
+    "NEXUS_LITE_MEM_POLL",
+    "XRUN_MEM_ENFORCER",
+    "XRUN_MEM_POLL",
+    "XRUN_ROOTS_INDEX",
+    "RUN_DIR",
 )
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_nexus_env(monkeypatch):
-    """Keep the suite independent of an enclosing nexus worker shell."""
+def _hermetic_nexus_env(monkeypatch, tmp_path_factory):
+    """Keep the suite independent of an enclosing nexus worker shell (and keep `job start` out of the real roots index)."""
     for name in _GUARD_ENV:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NEXUS_LITE_ROOTS_INDEX", str(tmp_path_factory.mktemp("rootsidx") / "roots"))
